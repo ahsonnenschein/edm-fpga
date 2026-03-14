@@ -1,0 +1,47 @@
+# Vivado build outputs
+*.bit
+*.log
+*.backup.log
+*.jou
+*.pb
+*.str
+*.wdb
+*.vcd
+*.dcp
+*.rpt
+*.xml
+*.html
+*.xpr
+*.ip_user_files
+*.cache
+*.hw
+*.runs
+*.sim
+*.gen
+*.srcs
+vivado_pid*.str
+vivado*.jou
+vivado*.log
+usage_statistics_webtalk.html
+webtalk*.xml
+
+# xsim simulation
+xsim.dir/
+sim_work/
+xelab.log
+xelab.pb
+xsim.jou
+xsim.log
+xvlog.log
+xvlog.pb
+tb_edm_top.vcd
+tb_edm_top_sim.wdb
+
+# Python
+__pycache__/
+*.py[cod]
+*.h5
+*.hdf5
+
+# Misc
+.DS_Store
