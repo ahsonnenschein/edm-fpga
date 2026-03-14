@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // edm_top.v
 // Top-level EDM FPGA controller for Red Pitaya STEMlab 125-14 (Zynq-7010)
 //

@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // axi_edm_regs.v
 // AXI4-Lite slave register file for EDM controller.
 //

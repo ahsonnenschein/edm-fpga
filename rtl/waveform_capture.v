@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // waveform_capture.v
 // Triggered ADC waveform capture.
 // On each trigger: captures capture_len samples from CH1 and CH2.

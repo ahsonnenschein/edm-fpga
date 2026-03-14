@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // edm_pulse_ctrl.v
 // EDM Pulse State Machine
 // Generates precise Ton/Toff pulse sequence.
