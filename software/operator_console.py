@@ -15,6 +15,8 @@ import sys
 import time
 import math
 import random
+import socket
+import struct
 import numpy as np
 from threading import Thread, Event
 
@@ -52,6 +54,7 @@ REG_WAVE_CNT    = 7
 
 DEFAULT_HOST    = "192.168.1.100"
 DEFAULT_PORT    = 502
+STREAM_PORT     = 5005   # waveform stream from waveform_manager.py
 
 PLOT_REFRESH_MS = 100   # ms between plot updates when connected / simulating
 
@@ -196,6 +199,10 @@ class PollWorker:
             self.signals.error.emit(str(e))
             return
 
+        # Start waveform stream receiver in a separate thread
+        stream_thread = Thread(target=self._run_stream, daemon=True)
+        stream_thread.start()
+
         while not self.stop_evt.is_set():
             try:
                 rr = self.client.read_holding_registers(REG_PULSE_CNT, 2)
@@ -206,6 +213,58 @@ class PollWorker:
             time.sleep(0.5)
 
         self.client.close()
+        stream_thread.join(timeout=2)
+
+    def _run_stream(self):
+        """Connect to waveform_manager TCP stream and receive waveform frames."""
+        while not self.stop_evt.is_set():
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(3)
+                sock.connect((self._host, STREAM_PORT))
+                sock.settimeout(None)
+            except Exception as e:
+                self.signals.error.emit(f"Waveform stream: {e}")
+                time.sleep(3)
+                continue
+
+            try:
+                while not self.stop_evt.is_set():
+                    # Read 4-byte header: n_samples
+                    header = self._recv_exact(sock, 4)
+                    if header is None:
+                        break
+                    n = struct.unpack("<I", header)[0]
+                    if n == 0 or n > 1_000_000:
+                        break
+
+                    body = self._recv_exact(sock, n * 8)  # ch1 + ch2, float32 each
+                    if body is None:
+                        break
+
+                    ch1 = np.frombuffer(body[:n * 4], dtype=np.float32).copy()
+                    ch2 = np.frombuffer(body[n * 4:], dtype=np.float32).copy()
+                    t   = np.arange(n, dtype=np.float32) / 125.0  # µs at 125 MSPS
+                    self.signals.waveform_ready.emit(t, ch1, ch2)
+            except Exception:
+                pass
+            finally:
+                try: sock.close()
+                except: pass
+
+    @staticmethod
+    def _recv_exact(sock: socket.socket, n: int):
+        """Read exactly n bytes from sock; return None on connection loss."""
+        buf = bytearray()
+        while len(buf) < n:
+            try:
+                chunk = sock.recv(n - len(buf))
+            except Exception:
+                return None
+            if not chunk:
+                return None
+            buf.extend(chunk)
+        return bytes(buf)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

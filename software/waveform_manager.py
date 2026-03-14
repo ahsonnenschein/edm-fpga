@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
 waveform_manager.py
-Reads EDM waveforms from AXI DMA, saves to HDF5, displays via matplotlib.
+Reads EDM waveforms from AXI DMA, saves to HDF5, displays via matplotlib,
+and streams decoded waveforms to connected operator consoles over TCP port 5005.
 
 Waveform data format (32-bit words from FPGA):
   bits [31:18] = CH1 (voltage, 14-bit 2's complement)
   bits [15:2]  = CH2 (current, 14-bit 2's complement)
+
+Wire protocol (port 5005):
+  Each frame: [4 bytes n_samples uint32 LE]
+              [n * 4 bytes CH1 float32 LE]
+              [n * 4 bytes CH2 float32 LE]
 
 AXI DMA base address: 0x40400000
 Waveform buffer: allocated in DDR, address passed to DMA.
@@ -22,6 +28,8 @@ import os
 import time
 import mmap
 import struct
+import socket
+import threading
 import ctypes
 import numpy as np
 import h5py
@@ -35,6 +43,7 @@ from pymodbus.client import ModbusTcpClient
 # -------------------------------------------------------
 MODBUS_HOST     = "localhost"
 MODBUS_PORT     = 502
+STREAM_PORT     = 5005   # waveform streaming to operator consoles
 
 DMA_BASE_ADDR   = 0x40400000
 DMA_ADDR_RANGE  = 0x10000
@@ -183,6 +192,67 @@ def should_act(counter, fraction_10000):
     return (counter % n) == 0
 
 
+class WaveformServer:
+    """
+    TCP server that broadcasts decoded waveforms to connected operator consoles.
+
+    Frame format:
+        [4 bytes]     n_samples  (uint32, little-endian)
+        [n * 4 bytes] CH1        (float32 array, little-endian)
+        [n * 4 bytes] CH2        (float32 array, little-endian)
+    """
+
+    def __init__(self, port: int = STREAM_PORT):
+        self._port    = port
+        self._clients = []          # list of open sockets
+        self._lock    = threading.Lock()
+        self._server  = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server.bind(("0.0.0.0", port))
+        self._server.listen(8)
+        self._thread  = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+        print(f"Waveform server listening on port {port}")
+
+    def _accept_loop(self):
+        while True:
+            try:
+                conn, addr = self._server.accept()
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                with self._lock:
+                    self._clients.append(conn)
+                print(f"Operator console connected from {addr[0]}:{addr[1]}")
+            except Exception:
+                break
+
+    def broadcast(self, ch1: np.ndarray, ch2: np.ndarray):
+        """Send one waveform frame to all connected clients."""
+        n      = len(ch1)
+        header = struct.pack("<I", n)
+        body   = ch1.astype(np.float32).tobytes() + ch2.astype(np.float32).tobytes()
+        frame  = header + body
+
+        dead = []
+        with self._lock:
+            for sock in self._clients:
+                try:
+                    sock.sendall(frame)
+                except Exception:
+                    dead.append(sock)
+            for sock in dead:
+                self._clients.remove(sock)
+                try: sock.close()
+                except: pass
+
+    def close(self):
+        self._server.close()
+        with self._lock:
+            for sock in self._clients:
+                try: sock.close()
+                except: pass
+            self._clients.clear()
+
+
 def main():
     os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -193,6 +263,8 @@ def main():
     dma_regs = MemMapped(DMA_BASE_ADDR, DMA_ADDR_RANGE)
     edm_regs = MemMapped(EDM_BASE_ADDR, EDM_ADDR_RANGE)
     dma      = WaveformDMA(dma_regs)
+
+    stream_server = WaveformServer(STREAM_PORT)
 
     stats = WaveformStats()
     waveform_counter = 0
@@ -243,6 +315,9 @@ def main():
                 stats.update(ch1, ch2, dt_s)
                 waveform_counter += 1
 
+                # Stream to connected operator consoles
+                stream_server.broadcast(ch1, ch2)
+
                 # Save to HDF5
                 if should_act(waveform_counter, f_save):
                     ds_name = f"wf_{waveform_counter:08d}"
@@ -268,6 +343,7 @@ def main():
         except KeyboardInterrupt:
             print("\nStopping.")
         finally:
+            stream_server.close()
             mb.close()
             dma.close()
             dma_regs.close()
