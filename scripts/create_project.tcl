@@ -1,6 +1,10 @@
 # create_project.tcl
-# Creates the Vivado project for the EDM FPGA controller
+# Creates the Vivado project for the EDM FPGA controller with 1 MSPS waveform capture.
 # Target: PYNQ-Z2 (Zynq XC7Z020-1CLG400C)
+#
+# Data path:
+#   XADC Wizard DRP outputs (eoc/channel/do) → edm_ctrl waveform_capture
+#   edm_ctrl M_AXIS → AXI DMA S_AXIS_S2MM → PS HP0 → DDR
 #
 # Usage from Vivado Tcl console or batch mode:
 #   cd /home/sonnensn/edm-fpga
@@ -17,14 +21,14 @@ set project_name "edm_pynq"
 puts "Creating project in $project_dir"
 create_project $project_name $project_dir -part $part -force
 
-# Add RTL sources (exclude waveform_capture — not used in this revision)
+# Add RTL sources
 add_files -fileset sources_1 [list \
     $rtl_dir/edm_top.v \
     $rtl_dir/edm_pulse_ctrl.v \
     $rtl_dir/axi_edm_regs.v \
+    $rtl_dir/waveform_capture.v \
 ]
 
-# Add constraints
 add_files -fileset constrs_1 "$xdc_dir/pynq_z2.xdc"
 
 # -------------------------------------------------------
@@ -33,7 +37,7 @@ add_files -fileset constrs_1 "$xdc_dir/pynq_z2.xdc"
 create_bd_design "edm_system"
 update_compile_order -fileset sources_1
 
-# Zynq-7020 PS (PYNQ-Z2, 100 MHz fabric clock)
+# ── Zynq PS ────────────────────────────────────────────
 create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 ps7
 set_property -dict [list \
     CONFIG.PCW_PRESET_BANK0_VOLTAGE      {LVCMOS 3.3V} \
@@ -42,11 +46,13 @@ set_property -dict [list \
     CONFIG.PCW_USE_M_AXI_GP0             {1} \
     CONFIG.PCW_EN_CLK0_PORT              {1} \
     CONFIG.PCW_EN_RST0_PORT              {1} \
+    CONFIG.PCW_USE_S_AXI_HP0             {1} \
 ] [get_bd_cells ps7]
 apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \
     -config {make_external "FIXED_IO, DDR"} [get_bd_cells ps7]
 
-# XADC Wizard — AXI interface, continuous sequencer on VP/VN (CH1) and VAUX1 (CH2, Arduino A0)
+# ── XADC Wizard ────────────────────────────────────────
+# AXI4-Lite for register access; DRP outputs (eoc/channel/do) go to fabric
 create_bd_cell -type ip -vlnv xilinx.com:ip:xadc_wiz:3.3 xadc_wiz_0
 set_property -dict [list \
     CONFIG.INTERFACE_SELECTION   {Enable_AXI} \
@@ -59,31 +65,45 @@ set_property -dict [list \
     CONFIG.ADC_CONVERSION_RATE   {1000} \
 ] [get_bd_cells xadc_wiz_0]
 
-# Expose VP/VN dedicated analog input to top level
-# Vaux1 (Arduino A0) is handled internally by XADC Wizard via PACKAGE_PIN in IP config
+# Expose VP/VN analog input
 make_bd_intf_pins_external [get_bd_intf_pins xadc_wiz_0/Vp_Vn]
 
-# AXI Interconnect: PS GP0 → EDM registers + XADC Wizard
+# ── AXI Interconnect: GP0 → EDM regs + XADC + DMA ─────
 create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_gp0
-set_property CONFIG.NUM_MI {2} [get_bd_cells axi_gp0]
+set_property CONFIG.NUM_MI {3} [get_bd_cells axi_gp0]
 
-# EDM top as RTL module reference in block design
+# ── EDM top (RTL module reference) ─────────────────────
 create_bd_cell -type module -reference edm_top edm_ctrl
 
+# ── AXI DMA (S2MM only: stream → memory via HP0) ───────
+create_bd_cell -type ip -vlnv xilinx.com:ip:axi_dma:7.1 axi_dma_0
+set_property -dict [list \
+    CONFIG.c_include_mm2s             {0} \
+    CONFIG.c_include_s2mm             {1} \
+    CONFIG.c_s2mm_burst_size          {16} \
+    CONFIG.c_s2mm_data_width          {32} \
+    CONFIG.c_sg_include_stscntrl_strm {0} \
+    CONFIG.c_sg_length_width          {16} \
+] [get_bd_cells axi_dma_0]
+
 # -------------------------------------------------------
-# Clock and reset connections
+# Clock and reset
 # -------------------------------------------------------
 set clk  [get_bd_pins ps7/FCLK_CLK0]
 set rstn [get_bd_pins ps7/FCLK_RESET0_N]
 
 foreach pin [list \
     ps7/M_AXI_GP0_ACLK \
+    ps7/S_AXI_HP0_ACLK \
     axi_gp0/ACLK \
     axi_gp0/S00_ACLK \
     axi_gp0/M00_ACLK \
     axi_gp0/M01_ACLK \
+    axi_gp0/M02_ACLK \
     edm_ctrl/S_AXI_ACLK \
     xadc_wiz_0/s_axi_aclk \
+    axi_dma_0/s_axi_lite_aclk \
+    axi_dma_0/m_axi_s2mm_aclk \
 ] { connect_bd_net $clk [get_bd_pins $pin] }
 
 foreach pin [list \
@@ -91,27 +111,48 @@ foreach pin [list \
     axi_gp0/S00_ARESETN \
     axi_gp0/M00_ARESETN \
     axi_gp0/M01_ARESETN \
+    axi_gp0/M02_ARESETN \
     edm_ctrl/S_AXI_ARESETN \
     xadc_wiz_0/s_axi_aresetn \
+    axi_dma_0/axi_resetn \
 ] { connect_bd_net $rstn [get_bd_pins $pin] }
 
 # -------------------------------------------------------
-# AXI connections
+# AXI control bus connections (GP0)
 # -------------------------------------------------------
-# PS GP0 → AXI interconnect
 connect_bd_intf_net [get_bd_intf_pins ps7/M_AXI_GP0] \
                     [get_bd_intf_pins axi_gp0/S00_AXI]
 
-# Interconnect M00 → EDM control registers
+# M00 → EDM control registers
 connect_bd_intf_net [get_bd_intf_pins axi_gp0/M00_AXI] \
                     [get_bd_intf_pins edm_ctrl/S_AXI]
 
-# Interconnect M01 → XADC Wizard AXI
+# M01 → XADC Wizard AXI
 connect_bd_intf_net [get_bd_intf_pins axi_gp0/M01_AXI] \
                     [get_bd_intf_pins xadc_wiz_0/s_axi_lite]
 
+# M02 → AXI DMA control
+connect_bd_intf_net [get_bd_intf_pins axi_gp0/M02_AXI] \
+                    [get_bd_intf_pins axi_dma_0/S_AXI_LITE]
+
 # -------------------------------------------------------
-# GPIO connections (make external for XDC pin assignment)
+# DMA data path: edm_ctrl stream → DMA → PS HP0 → DDR
+# -------------------------------------------------------
+connect_bd_intf_net [get_bd_intf_pins edm_ctrl/M_AXIS] \
+                    [get_bd_intf_pins axi_dma_0/S_AXIS_S2MM]
+
+connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXI_S2MM] \
+                    [get_bd_intf_pins ps7/S_AXI_HP0]
+
+# -------------------------------------------------------
+# XADC DRP fabric outputs → edm_ctrl waveform_capture
+# -------------------------------------------------------
+connect_bd_net [get_bd_pins xadc_wiz_0/eoc_out]     [get_bd_pins edm_ctrl/xadc_eoc]
+connect_bd_net [get_bd_pins xadc_wiz_0/channel_out]  [get_bd_pins edm_ctrl/xadc_channel]
+connect_bd_net [get_bd_pins xadc_wiz_0/do_out]       [get_bd_pins edm_ctrl/xadc_do]
+
+# -------------------------------------------------------
+# GPIO: expose EDM I/O to top level for XDC constraints
 # -------------------------------------------------------
 make_bd_pins_external [get_bd_pins edm_ctrl/hv_enable]
 make_bd_pins_external [get_bd_pins edm_ctrl/pulse_out]
@@ -128,7 +169,7 @@ assign_bd_address
 set all_segs [get_bd_addr_segs ps7/Data/*]
 puts "Address segments: $all_segs"
 
-# Move XADC first to free up the auto-assigned 0x43C00000 range
+# Move XADC to 0x43C20000 first (frees default 0x43C00000 range)
 foreach seg $all_segs {
     set name [get_property NAME $seg]
     if {[string match "*xadc*" $name]} {
@@ -137,13 +178,22 @@ foreach seg $all_segs {
         puts "XADC segment: $seg -> 0x43C20000"
     }
 }
-# Now assign EDM registers (0x43C00000 is now free)
+# EDM registers at 0x43C00000
 foreach seg $all_segs {
     set name [get_property NAME $seg]
     if {[string match "*edm_ctrl*" $name]} {
         set_property offset 0x43C00000 $seg
         set_property range  4K         $seg
         puts "EDM  segment: $seg -> 0x43C00000"
+    }
+}
+# AXI DMA control at 0x40400000
+foreach seg $all_segs {
+    set name [get_property NAME $seg]
+    if {[string match "*axi_dma*" $name]} {
+        set_property offset 0x40400000 $seg
+        set_property range  64K        $seg
+        puts "DMA  segment: $seg -> 0x40400000"
     }
 }
 
@@ -153,7 +203,6 @@ foreach seg $all_segs {
 validate_bd_design
 save_bd_design
 
-# Generate HDL wrapper
 make_wrapper -files [get_files edm_system.bd] -top
 set wrapper [glob $project_dir/$project_name.gen/sources_1/bd/edm_system/hdl/edm_system_wrapper.v]
 add_files -norecurse $wrapper

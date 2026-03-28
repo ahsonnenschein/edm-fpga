@@ -3,7 +3,10 @@
 operator_console.py  —  EDM Controller Operator Console (PYNQ-Z2)
 
 Left panel:  Connection | Parameters | Status
-Right panel: Rolling waveform (CH1 gap voltage, CH2 arc current) + statistics
+Right panel: Per-burst waveform (CH1 gap voltage, CH2 arc current) + statistics
+
+Waveform display shows the most recent continuous block of samples where
+'enable' was active (sparks running), subsampled by the prescale factor.
 
 Connects to xadc_server.py running on the PYNQ-Z2 board.
 Simulation mode works without a board connection.
@@ -27,10 +30,10 @@ matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-DEFAULT_HOST   = "192.168.2.99"
-SERVER_PORT    = 5006
-WINDOW_SEC     = 5.0      # rolling waveform window width
-PLOT_REFRESH_MS = 80      # ~12 fps
+DEFAULT_HOST    = "192.168.2.99"
+SERVER_PORT     = 5006
+PLOT_REFRESH_MS = 100       # 10 fps
+BUF_MAX         = 60_000    # ~5 min at 200 Hz
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,9 +48,9 @@ class SimSource:
         self.ton_us   = 10
         self.toff_us  = 90
         self.enable   = False
-        self._phase   = 0.0       # position within current Ton+Toff cycle (0-1)
+        self._phase   = 0.0
         self._in_arc  = False
-        self._bd_frac = 0.2       # breakdown fraction within Ton
+        self._bd_frac = 0.2
         self._pulse_count = 0
         self._t_last  = time.time()
 
@@ -62,26 +65,21 @@ class SimSource:
 
         period_us = self.ton_us + self.toff_us
         self._phase = (self._phase + dt * 1e6 / period_us) % 1.0
-
         ton_frac  = self.ton_us / period_us
 
         if self._phase < ton_frac:
-            # Within Ton
             pos_in_ton = self._phase / ton_frac
             if pos_in_ton < self._bd_frac:
-                # Open gap — high voltage, zero current
                 ch1 = 55 + random.gauss(0, 1.0)
                 ch2 = 0.0
             else:
-                # Arc — low voltage, arc current
                 if not self._in_arc:
                     self._in_arc = True
                     self._pulse_count += 1
                     self._bd_frac = random.uniform(0.1, 0.5)
                 ch1 = random.gauss(22, 2.0)
-                ch2 = random.gauss(0.8, 0.05)   # 0-3.3V proxy for current
+                ch2 = random.gauss(0.8, 0.05)
         else:
-            # Toff — gap recovering
             self._in_arc = False
             ch1 = 0.0
             ch2 = 0.0
@@ -97,10 +95,11 @@ class SimSource:
 # Worker signals
 # ─────────────────────────────────────────────────────────────────────────────
 class WorkerSignals(QObject):
-    sample_ready    = Signal(float, float, float)   # ch1, ch2, ts
-    status_update   = Signal(dict)                  # full status dict
-    connection_ok   = Signal(bool)
-    error           = Signal(str)
+    sample_ready  = Signal(float, float, float)   # ch1, ch2, ts  (status frame)
+    burst_ready   = Signal(object, object)         # ch1_list, ch2_list (burst frame)
+    status_update = Signal(dict)
+    connection_ok = Signal(bool)
+    error         = Signal(str)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -140,18 +139,13 @@ class PollWorker:
     def _apply_sim_cmd(self, cmd):
         c = cmd.get('cmd', '')
         v = cmd.get('value', 0)
-        if c == 'set_ton':
-            self._sim.ton_us = int(v)
-        elif c == 'set_toff':
-            self._sim.toff_us = int(v)
-        elif c == 'set_enable':
-            self._sim.enable = bool(v)
+        if c == 'set_ton':    self._sim.ton_us   = int(v)
+        elif c == 'set_toff': self._sim.toff_us  = int(v)
+        elif c == 'set_enable': self._sim.enable = bool(v)
 
     def _run(self):
-        if self.sim_mode:
-            self._run_sim()
-        else:
-            self._run_network()
+        if self.sim_mode: self._run_sim()
+        else:             self._run_network()
 
     def _run_sim(self):
         self.signals.connection_ok.emit(True)
@@ -192,12 +186,18 @@ class PollWorker:
                         line, buf = buf.split(b'\n', 1)
                         try:
                             d = json.loads(line)
-                            self.signals.sample_ready.emit(
-                                d.get('ch1', 0.0),
-                                d.get('ch2', 0.0),
-                                d.get('ts',  time.time()),
-                            )
-                            self.signals.status_update.emit(d)
+                            if d.get('type') == 'burst':
+                                self.signals.burst_ready.emit(
+                                    d.get('ch1', []),
+                                    d.get('ch2', []),
+                                )
+                            else:
+                                self.signals.sample_ready.emit(
+                                    d.get('ch1', 0.0),
+                                    d.get('ch2', 0.0),
+                                    d.get('ts',  time.time()),
+                                )
+                                self.signals.status_update.emit(d)
                         except Exception:
                             pass
                 except socket.timeout:
@@ -216,16 +216,31 @@ class PollWorker:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Waveform plot widget — rolling time window
+# Per-burst waveform widget
 # ─────────────────────────────────────────────────────────────────────────────
 class WaveformWidget(QWidget):
-    MAX_SAMPLES = 4000   # keep last 4000 samples (~20 s at 200 Hz)
+    """
+    Displays a rolling window of the most recent samples received while
+    enable=1 (sparks active), sized to show approximately 10 Ton+Toff cycles.
+
+    Call set_timing(ton_us, toff_us) whenever the pulse parameters change so
+    the window width stays calibrated.  A prescale of N shows every Nth sample.
+
+    Each entry in the buffer is (ts, ch1, ch2, enable).
+    """
+
+    PULSE_WINDOW = 10   # number of Ton+Toff cycles to display
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._ts   = deque(maxlen=self.MAX_SAMPLES)
-        self._ch1  = deque(maxlen=self.MAX_SAMPLES)
-        self._ch2  = deque(maxlen=self.MAX_SAMPLES)
+        self._buf      = deque(maxlen=BUF_MAX)
+        self._prescale = 1
+        self._ton_us   = 10
+        self._toff_us  = 90
+        self._has_burst  = False
+        self._burst_ch1  = np.array([])
+        self._burst_ch2  = np.array([])
+        self._burst_t    = np.array([])
 
         self.fig = Figure(figsize=(7, 4), tight_layout=True)
         self.fig.patch.set_facecolor('#1e1e1e')
@@ -240,17 +255,20 @@ class WaveformWidget(QWidget):
 
         self.ax1.set_ylabel("Gap Voltage (V)", color='#cccccc', fontsize=8)
         self.ax1.set_ylim(-2, 80)
-        self.ax1.set_title("CH1 – Gap Voltage", color='#cccccc', fontsize=9)
         self.ax1.yaxis.label.set_color('#cccccc')
 
         self.ax2.set_ylabel("Arc Current proxy (V)", color='#cccccc', fontsize=8)
-        self.ax2.set_xlabel("Time (s)", color='#cccccc', fontsize=8)
+        self.ax2.set_xlabel("Time in burst (s)", color='#cccccc', fontsize=8)
         self.ax2.set_ylim(-0.1, 3.5)
-        self.ax2.set_title("CH2 – Arc Current (GEDM output)", color='#cccccc', fontsize=9)
         self.ax2.yaxis.label.set_color('#cccccc')
 
         self.line1, = self.ax1.plot([], [], color='#2196F3', lw=0.8)
         self.line2, = self.ax2.plot([], [], color='#F44336', lw=0.8)
+
+        self._title1 = self.ax1.set_title(
+            "CH1 – Gap Voltage", color='#cccccc', fontsize=9)
+        self._title2 = self.ax2.set_title(
+            "CH2 – Arc Current (GEDM output)", color='#cccccc', fontsize=9)
 
         self.canvas = FigureCanvas(self.fig)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -258,28 +276,140 @@ class WaveformWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.canvas)
 
-    def add_sample(self, ch1: float, ch2: float, ts: float):
-        self._ts.append(ts)
-        self._ch1.append(ch1)
-        self._ch2.append(ch2)
+    def add_sample(self, ch1: float, ch2: float, ts: float, enable: bool):
+        self._buf.append((ts, ch1, ch2, enable))
+
+    def add_burst(self, ch1_list: list, ch2_list: list):
+        """Replace display with a hardware DMA burst (already at ~500 kSPS)."""
+        if not ch1_list:
+            return
+        n    = len(ch1_list)
+        dt   = 1.0 / 500_000   # ~500 kSPS per channel
+        now  = time.time()
+        self._burst_ch1 = np.array(ch1_list, dtype=np.float32)
+        self._burst_ch2 = np.array(ch2_list, dtype=np.float32)
+        self._burst_t   = np.arange(n) * dt
+        self._has_burst = True
+
+    def set_prescale(self, n: int):
+        self._prescale = max(1, n)
+
+    def set_timing(self, ton_us: int, toff_us: int):
+        self._ton_us  = max(1, ton_us)
+        self._toff_us = max(1, toff_us)
+
+    def _window_seconds(self):
+        # Pulse-period window, but never less than 1 s so there are always
+        # visible samples regardless of sample rate vs pulse rate.
+        return max(self.PULSE_WINDOW * (self._ton_us + self._toff_us) * 1e-6, 1.0)
 
     def refresh(self):
-        if len(self._ts) < 2:
+        # Hardware DMA bursts take priority over the 200 Hz status samples
+        if self._has_burst:
+            self._refresh_burst()
             return
-        ts   = np.array(self._ts)
-        ch1  = np.array(self._ch1)
-        ch2  = np.array(self._ch2)
 
-        t_now  = ts[-1]
-        t_min  = t_now - WINDOW_SEC
-        mask   = ts >= t_min
-        t_rel  = ts[mask] - t_min   # seconds from left edge
+        if not self._buf:
+            return
 
-        self.line1.set_data(t_rel, ch1[mask])
-        self.line2.set_data(t_rel, ch2[mask])
-        self.ax1.set_xlim(0, WINDOW_SEC)
-        self.ax2.set_xlim(0, WINDOW_SEC)
+        buf = list(self._buf)
+        end = len(buf) - 1
+
+        # If currently disabled, find the most recent sample where enable was True
+        if not buf[end][3]:
+            while end >= 0 and not buf[end][3]:
+                end -= 1
+            if end < 0:
+                self._show_idle()
+                return
+
+        # Walk back to find the start of this enable=1 run
+        start = end
+        while start > 0 and buf[start - 1][3]:
+            start -= 1
+
+        burst = buf[start:end + 1]
+        if len(burst) < 2:
+            return
+
+        # Trim to the most recent ~10 pulse periods
+        window_s  = self._window_seconds()
+        t_cutoff  = burst[-1][0] - window_s
+        trim_start = 0
+        for i, s in enumerate(burst):
+            if s[0] >= t_cutoff:
+                trim_start = i
+                break
+        burst = burst[trim_start:]
+
+        # Apply prescale
+        n   = self._prescale
+        sub = burst[::n]
+
+        ts_arr  = np.array([s[0] for s in sub])
+        ch1_arr = np.array([s[1] for s in sub])
+        ch2_arr = np.array([s[2] for s in sub])
+        t_rel   = ts_arr - ts_arr[0]
+
+        self.line1.set_data(t_rel, ch1_arr)
+        self.line2.set_data(t_rel, ch2_arr)
+
+        x_max = max(window_s, t_rel[-1], 0.001)
+        self.ax1.set_xlim(0, x_max)
+        self.ax2.set_xlim(0, x_max)
+
+        live      = buf[-1][3]
+        state_tag = "LIVE" if live else "last burst"
+        n_total   = len(burst)
+        dur_ms    = window_s * 1000
+
+        self._title1.set_text(
+            f"CH1 – Gap Voltage  [last {self.PULSE_WINDOW} pulses "
+            f"({dur_ms:.3g} ms), {n_total} samples, 1/{n} shown — {state_tag}]"
+        )
         self.canvas.draw_idle()
+
+    def _refresh_burst(self):
+        n   = self._prescale
+        sub_t   = self._burst_t[::n]
+        sub_ch1 = self._burst_ch1[::n]
+        sub_ch2 = self._burst_ch2[::n]
+        self.line1.set_data(sub_t * 1e6, sub_ch1)   # x in µs
+        self.line2.set_data(sub_t * 1e6, sub_ch2)
+        x_max = max(self._burst_t[-1] * 1e6, 1.0)
+        self.ax1.set_xlim(0, x_max)
+        self.ax2.set_xlim(0, x_max)
+        self.ax2.set_xlabel("Time in pulse (µs)", color='#cccccc', fontsize=8)
+        n_total = len(self._burst_ch1)
+        self._title1.set_text(
+            f"CH1 – Gap Voltage  [{n_total} samples @ ~500 kSPS, 1/{n} shown — HW burst]"
+        )
+        self.canvas.draw_idle()
+
+    def _show_idle(self):
+        self.line1.set_data([], [])
+        self.line2.set_data([], [])
+        self._title1.set_text("CH1 – Gap Voltage  [waiting for enable…]")
+        self.canvas.draw_idle()
+
+    # expose arrays for stats
+    def last_burst_arrays(self):
+        """Return (ch1_arr, ch2_arr) for the most recent burst, or empty arrays."""
+        buf = list(self._buf)
+        end = len(buf) - 1
+        if not buf:
+            return np.array([]), np.array([])
+        if not buf[end][3]:
+            while end >= 0 and not buf[end][3]:
+                end -= 1
+            if end < 0:
+                return np.array([]), np.array([])
+        start = end
+        while start > 0 and buf[start - 1][3]:
+            start -= 1
+        burst = buf[start:end + 1]
+        return (np.array([s[1] for s in burst]),
+                np.array([s[2] for s in burst]))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,14 +423,14 @@ class StatsWidget(QGroupBox):
         self._ch2_peak = QLabel("—")
         self._rate     = QLabel("—")
         self._temp     = QLabel("—")
-        f.addRow("V peak (V):",        self._v_peak)
-        f.addRow("CH2 peak (V):",      self._ch2_peak)
-        f.addRow("Pulse rate (Hz):",   self._rate)
-        f.addRow("Chip temp (°C):",    self._temp)
+        f.addRow("V peak (V):",      self._v_peak)
+        f.addRow("CH2 peak (V):",    self._ch2_peak)
+        f.addRow("Pulse rate (Hz):", self._rate)
+        f.addRow("Chip temp (°C):",  self._temp)
 
-        self._last_pulse_count = 0
-        self._t_start = time.time()
-        self._pulses_in_window = 0
+        self._last_pulse_count  = 0
+        self._t_start           = time.time()
+        self._pulses_in_window  = 0
 
     def update(self, ch1_arr, ch2_arr, status: dict):
         if len(ch1_arr):
@@ -331,13 +461,15 @@ class OperatorConsole(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("EDM Controller – PYNQ-Z2")
-        self.resize(1200, 660)
+        self.resize(1200, 700)
 
-        self._signals = WorkerSignals()
-        self._worker  = PollWorker(self._signals)
-        self._last_status: dict = {}
+        self._signals     = WorkerSignals()
+        self._worker      = PollWorker(self._signals)
+        self._last_status : dict = {}
+        self._last_enable : bool = False
 
         self._signals.sample_ready.connect(self._on_sample)
+        self._signals.burst_ready.connect(self._on_burst)
         self._signals.status_update.connect(self._on_status)
         self._signals.connection_ok.connect(self._on_connection)
         self._signals.error.connect(self._on_error)
@@ -378,8 +510,14 @@ class OperatorConsole(QMainWindow):
         # Parameters
         pbox = QGroupBox("Parameters")
         pf   = QFormLayout(pbox)
-        self._ton_spin  = QSpinBox(); self._ton_spin.setRange(1, 10000);  self._ton_spin.setValue(10);  self._ton_spin.setSuffix(" µs")
-        self._toff_spin = QSpinBox(); self._toff_spin.setRange(1, 100000); self._toff_spin.setValue(90); self._toff_spin.setSuffix(" µs")
+        self._ton_spin  = QSpinBox()
+        self._ton_spin.setRange(1, 10000)
+        self._ton_spin.setValue(10)
+        self._ton_spin.setSuffix(" µs")
+        self._toff_spin = QSpinBox()
+        self._toff_spin.setRange(1, 100000)
+        self._toff_spin.setValue(90)
+        self._toff_spin.setSuffix(" µs")
         self._enable_btn = QPushButton("Enable Pulses")
         self._enable_btn.setCheckable(True)
         self._enable_btn.setStyleSheet(
@@ -397,14 +535,15 @@ class OperatorConsole(QMainWindow):
         # Status
         sbox = QGroupBox("Status")
         sf   = QFormLayout(sbox)
-        self._lbl_conn   = QLabel("Disconnected"); self._lbl_conn.setStyleSheet("color: gray;")
+        self._lbl_conn   = QLabel("Disconnected")
+        self._lbl_conn.setStyleSheet("color: gray;")
         self._lbl_pulse  = QLabel("—")
         self._lbl_hven   = QLabel("—")
         self._lbl_enable = QLabel("—")
-        sf.addRow("Link:",         self._lbl_conn)
-        sf.addRow("Pulse count:",  self._lbl_pulse)
-        sf.addRow("HV switch:",    self._lbl_hven)
-        sf.addRow("Sparks:",       self._lbl_enable)
+        sf.addRow("Link:",        self._lbl_conn)
+        sf.addRow("Pulse count:", self._lbl_pulse)
+        sf.addRow("HV switch:",   self._lbl_hven)
+        sf.addRow("Sparks:",      self._lbl_enable)
         left.addWidget(sbox)
 
         left.addStretch()
@@ -413,13 +552,32 @@ class OperatorConsole(QMainWindow):
         right = QVBoxLayout()
         root.addLayout(right, stretch=1)
 
+        # Prescale control bar
+        pscale_row = QHBoxLayout()
+        pscale_row.addWidget(QLabel("Prescale  1/"))
+        self._prescale_spin = QSpinBox()
+        self._prescale_spin.setRange(1, 1000)
+        self._prescale_spin.setValue(1)
+        self._prescale_spin.setToolTip(
+            "Show every Nth sample.  1 = show all,  10 = show every 10th sample."
+        )
+        self._prescale_spin.valueChanged.connect(self._on_prescale_changed)
+        pscale_row.addWidget(self._prescale_spin)
+        pscale_row.addStretch()
+        right.addLayout(pscale_row)
+
         self._wave_widget = WaveformWidget()
+        self._wave_widget.set_timing(
+            self._ton_spin.value(), self._toff_spin.value()
+        )
         right.addWidget(self._wave_widget, stretch=3)
 
         self._stats_widget = StatsWidget()
         right.addWidget(self._stats_widget, stretch=0)
 
-        self.statusBar().showMessage("Enable Simulation mode and click Connect, or enter board IP and connect to hardware.")
+        self.statusBar().showMessage(
+            "Enable Simulation mode and click Connect, or enter board IP and connect to hardware."
+        )
 
     # ── slots ─────────────────────────────────────────────────────────────────
 
@@ -447,13 +605,21 @@ class OperatorConsole(QMainWindow):
         toff = self._toff_spin.value()
         self._worker.send_cmd({'cmd': 'set_ton',  'value': ton})
         self._worker.send_cmd({'cmd': 'set_toff', 'value': toff})
+        self._wave_widget.set_timing(ton, toff)
         self.statusBar().showMessage(f"Parameters applied: Ton={ton}µs  Toff={toff}µs")
 
+    def _on_prescale_changed(self, value: int):
+        self._wave_widget.set_prescale(value)
+
     def _on_sample(self, ch1: float, ch2: float, ts: float):
-        self._wave_widget.add_sample(ch1, ch2, ts)
+        self._wave_widget.add_sample(ch1, ch2, ts, self._last_enable)
+
+    def _on_burst(self, ch1_list, ch2_list):
+        self._wave_widget.add_burst(ch1_list, ch2_list)
 
     def _on_status(self, d: dict):
         self._last_status = d
+        self._last_enable = bool(d.get('enable', 0))
         self._lbl_pulse.setText(str(d.get('pulse_count', '—')))
 
         hven = d.get('hv_enable')
@@ -476,10 +642,8 @@ class OperatorConsole(QMainWindow):
 
     def _refresh_plot(self):
         self._wave_widget.refresh()
-        w  = self._wave_widget
-        ch1 = np.array(w._ch1)
-        ch2 = np.array(w._ch2)
-        self._stats_widget.update(ch1, ch2, self._last_status)
+        ch1_arr, ch2_arr = self._wave_widget.last_burst_arrays()
+        self._stats_widget.update(ch1_arr, ch2_arr, self._last_status)
 
     def _on_connection(self, ok: bool):
         if ok:

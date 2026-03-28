@@ -3,15 +3,17 @@
 // AXI4-Lite slave register file for EDM controller.
 //
 // Register map (byte addresses, 32-bit words):
-//   0x00  ton_cycles   RW  Ton duration in clock cycles (ton_us * 100)
-//   0x04  toff_cycles  RW  Toff duration in clock cycles
-//   0x08  enable       RW  bit[0]: 1=run, 0=stop
-//   0x0C  pulse_count  RO  Running count of pulses fired
-//   0x10  hv_enable    RO  bit[0]: operator HV enable switch state
+//   0x00  ton_cycles      RW  Ton duration in clock cycles (ton_us * 100)
+//   0x04  toff_cycles     RW  Toff duration in clock cycles
+//   0x08  enable          RW  bit[0]: 1=run, 0=stop
+//   0x0C  pulse_count     RO  Running count of pulses fired
+//   0x10  hv_enable       RO  bit[0]: operator HV enable switch state
+//   0x14  capture_len     RW  Waveform samples to capture per pulse (default 10)
+//   0x18  waveform_count  RO  Number of waveforms captured since reset
 
 module axi_edm_regs #(
     parameter C_S_AXI_DATA_WIDTH = 32,
-    parameter C_S_AXI_ADDR_WIDTH = 5   // covers 5 x 4-byte registers = 20 bytes
+    parameter C_S_AXI_ADDR_WIDTH = 5   // bits [4:2] → 8 word registers (0x00-0x1C)
 )(
     // AXI4-Lite slave
     input  wire                             S_AXI_ACLK,
@@ -40,10 +42,12 @@ module axi_edm_regs #(
     output reg  [31:0] ton_cycles,
     output reg  [31:0] toff_cycles,
     output reg         enable,
+    output reg  [15:0] capture_len,
 
     // Status inputs (read-only registers)
     input  wire [31:0] pulse_count,
-    input  wire        hv_enable_in
+    input  wire        hv_enable_in,
+    input  wire [31:0] waveform_count
 );
 
 reg [C_S_AXI_ADDR_WIDTH-1:0] axi_awaddr;
@@ -59,13 +63,12 @@ always @(posedge S_AXI_ACLK) begin
         S_AXI_BVALID  <= 1'b0;
         S_AXI_BRESP   <= 2'b00;
         axi_awaddr    <= 0;
-        // Default register values
-        ton_cycles    <= 32'd1000;   // 10 us * 100 MHz
-        toff_cycles   <= 32'd9000;   // 90 us * 100 MHz
+        ton_cycles    <= 32'd1000;   // 10 µs × 100 MHz
+        toff_cycles   <= 32'd9000;   // 90 µs × 100 MHz
         enable        <= 1'b0;
+        capture_len   <= 16'd10;     // default: 10 sample pairs per pulse
     end else begin
 
-        // AW handshake
         if (!S_AXI_AWREADY && S_AXI_AWVALID && S_AXI_WVALID) begin
             S_AXI_AWREADY <= 1'b1;
             axi_awaddr    <= S_AXI_AWADDR;
@@ -73,25 +76,23 @@ always @(posedge S_AXI_ACLK) begin
             S_AXI_AWREADY <= 1'b0;
         end
 
-        // W handshake
         if (!S_AXI_WREADY && S_AXI_AWVALID && S_AXI_WVALID) begin
             S_AXI_WREADY <= 1'b1;
         end else begin
             S_AXI_WREADY <= 1'b0;
         end
 
-        // Register write (word address = byte_addr[4:2])
         if (S_AXI_AWREADY && S_AXI_AWVALID && S_AXI_WREADY && S_AXI_WVALID) begin
             case (axi_awaddr[4:2])
                 3'd0: ton_cycles  <= S_AXI_WDATA;
                 3'd1: toff_cycles <= S_AXI_WDATA;
                 3'd2: enable      <= S_AXI_WDATA[0];
-                // 3, 4: read-only
+                3'd5: capture_len <= S_AXI_WDATA[15:0];
+                // 3 (pulse_count), 4 (hv_enable), 6 (waveform_count): read-only
                 default: ;
             endcase
         end
 
-        // B channel
         if (S_AXI_AWREADY && S_AXI_AWVALID && S_AXI_WREADY && S_AXI_WVALID && !S_AXI_BVALID) begin
             S_AXI_BVALID <= 1'b1;
             S_AXI_BRESP  <= 2'b00;
@@ -113,7 +114,6 @@ always @(posedge S_AXI_ACLK) begin
         axi_araddr    <= 0;
     end else begin
 
-        // AR handshake
         if (!S_AXI_ARREADY && S_AXI_ARVALID) begin
             S_AXI_ARREADY <= 1'b1;
             axi_araddr    <= S_AXI_ARADDR;
@@ -121,7 +121,6 @@ always @(posedge S_AXI_ACLK) begin
             S_AXI_ARREADY <= 1'b0;
         end
 
-        // R channel
         if (S_AXI_ARREADY && S_AXI_ARVALID && !S_AXI_RVALID) begin
             S_AXI_RVALID <= 1'b1;
             S_AXI_RRESP  <= 2'b00;
@@ -131,6 +130,8 @@ always @(posedge S_AXI_ACLK) begin
                 3'd2: S_AXI_RDATA <= {31'd0, enable};
                 3'd3: S_AXI_RDATA <= pulse_count;
                 3'd4: S_AXI_RDATA <= {31'd0, hv_enable_in};
+                3'd5: S_AXI_RDATA <= {16'd0, capture_len};
+                3'd6: S_AXI_RDATA <= waveform_count;
                 default: S_AXI_RDATA <= 32'd0;
             endcase
         end else if (S_AXI_RVALID && S_AXI_RREADY) begin
