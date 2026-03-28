@@ -1,30 +1,23 @@
 #!/usr/bin/env python3
 """
-operator_console.py
-EDM Controller Operator Console
+operator_console.py  —  EDM Controller Operator Console (PYNQ-Z2)
 
 Left panel:  Connection | Parameters | Status
-Right panel: Live waveform plots (CH1 voltage, CH2 current)
-             Statistics stub (expandable later)
+Right panel: Rolling waveform (CH1 gap voltage, CH2 arc current) + statistics
 
-Simulation mode generates synthetic EDM-like waveforms so the app
-can be tested before the Red Pitaya board arrives.
+Connects to xadc_server.py running on the PYNQ-Z2 board.
+Simulation mode works without a board connection.
 """
 
-import sys
-import time
-import math
-import random
-import socket
-import struct
+import sys, time, json, math, random, socket
 import numpy as np
+from collections import deque
 from threading import Thread, Event
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGroupBox, QLabel, QLineEdit, QPushButton, QCheckBox, QSlider,
-    QSpinBox, QDoubleSpinBox, QFormLayout, QSizePolicy, QFrame,
-    QStatusBar,
+    QGroupBox, QLabel, QLineEdit, QPushButton, QCheckBox,
+    QSpinBox, QFormLayout, QSizePolicy, QFrame,
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
 from PySide6.QtGui import QFont
@@ -34,310 +27,301 @@ matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-# ── Modbus (optional – imported lazily so sim mode works without it) ──────────
-try:
-    from pymodbus.client import ModbusTcpClient
-    MODBUS_AVAILABLE = True
-except ImportError:
-    MODBUS_AVAILABLE = False
-
-# ── Register indices (holding registers, 0-based) ────────────────────────────
-REG_TON_US      = 0
-REG_TOFF_US     = 1
-REG_ENABLE      = 2
-REG_CAPTURE_US  = 3
-REG_FSAVE       = 4   # 0-10000 (× 0.01 %)
-REG_FDISPLAY    = 5
-# Input registers (read-only, mapped to holding regs 6-7 in server)
-REG_PULSE_CNT   = 6
-REG_WAVE_CNT    = 7
-
-DEFAULT_HOST    = "192.168.1.100"
-DEFAULT_PORT    = 502
-STREAM_PORT     = 5005   # waveform stream from waveform_manager.py
-
-PLOT_REFRESH_MS = 100   # ms between plot updates when connected / simulating
+DEFAULT_HOST   = "192.168.2.99"
+SERVER_PORT    = 5006
+WINDOW_SEC     = 5.0      # rolling waveform window width
+PLOT_REFRESH_MS = 80      # ~12 fps
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Simulation waveform generator
 # ─────────────────────────────────────────────────────────────────────────────
-class SimWaveform:
-    """Generates one synthetic EDM waveform (CH1 voltage, CH2 current)."""
+class SimSource:
+    """
+    Generates a realistic EDM gap voltage / arc current time-series at ~200 Hz.
+    Models the pulse-idle-breakdown-arc cycle visible on a real oscilloscope.
+    """
+    def __init__(self):
+        self.ton_us   = 10
+        self.toff_us  = 90
+        self.enable   = False
+        self._phase   = 0.0       # position within current Ton+Toff cycle (0-1)
+        self._in_arc  = False
+        self._bd_frac = 0.2       # breakdown fraction within Ton
+        self._pulse_count = 0
+        self._t_last  = time.time()
 
-    def __init__(self, ton_us: int = 10, capture_us: int = 20):
-        self.ton_us     = ton_us
-        self.capture_us = capture_us
+    def sample(self):
+        """Return (ch1_V, ch2_V) at the current simulated instant."""
+        now = time.time()
+        dt  = now - self._t_last
+        self._t_last = now
 
-    def generate(self):
-        n   = self.capture_us * 125          # samples at 125 MSPS
-        t   = np.linspace(0, self.capture_us, n)  # µs
+        if not self.enable:
+            return 0.0, 0.0
 
-        # CH1: voltage – high before breakdown, drops to ~20-40 V during arc
-        v_gap   = 60 + random.uniform(-5, 5)
-        v_arc   = random.uniform(18, 35)
-        bd_idx  = int(random.uniform(0.05, 0.30) * n)  # breakdown point
+        period_us = self.ton_us + self.toff_us
+        self._phase = (self._phase + dt * 1e6 / period_us) % 1.0
 
-        ch1 = np.full(n, v_gap)
-        ch1[bd_idx:] = v_arc + np.random.normal(0, 1.5, n - bd_idx)
-        # Smooth transition
-        ramp = min(15, bd_idx)
-        ch1[bd_idx - ramp:bd_idx] = np.linspace(v_gap, v_arc, ramp)
+        ton_frac  = self.ton_us / period_us
 
-        # CH2: current – zero before breakdown, arc current during pulse
-        i_arc = random.uniform(3.0, 8.0)
-        ch2 = np.zeros(n)
-        ch2[bd_idx:] = i_arc + np.abs(np.random.normal(0, 0.5, n - bd_idx))
-        # Exponential rise
-        rise = min(20, n - bd_idx)
-        ch2[bd_idx:bd_idx + rise] *= np.linspace(0, 1, rise)
+        if self._phase < ton_frac:
+            # Within Ton
+            pos_in_ton = self._phase / ton_frac
+            if pos_in_ton < self._bd_frac:
+                # Open gap — high voltage, zero current
+                ch1 = 55 + random.gauss(0, 1.0)
+                ch2 = 0.0
+            else:
+                # Arc — low voltage, arc current
+                if not self._in_arc:
+                    self._in_arc = True
+                    self._pulse_count += 1
+                    self._bd_frac = random.uniform(0.1, 0.5)
+                ch1 = random.gauss(22, 2.0)
+                ch2 = random.gauss(0.8, 0.05)   # 0-3.3V proxy for current
+        else:
+            # Toff — gap recovering
+            self._in_arc = False
+            ch1 = 0.0
+            ch2 = 0.0
 
-        return t, ch1, ch2
+        return max(0.0, ch1), max(0.0, ch2)
+
+    @property
+    def pulse_count(self):
+        return self._pulse_count
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Worker thread signals
+# Worker signals
 # ─────────────────────────────────────────────────────────────────────────────
 class WorkerSignals(QObject):
-    waveform_ready = Signal(object, object, object)   # t, ch1, ch2
-    status_update  = Signal(int, int)                 # pulse_cnt, wave_cnt
-    connection_ok  = Signal(bool)
-    error          = Signal(str)
+    sample_ready    = Signal(float, float, float)   # ch1, ch2, ts
+    status_update   = Signal(dict)                  # full status dict
+    connection_ok   = Signal(bool)
+    error           = Signal(str)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Modbus / sim polling worker
+# Poll / sim worker
 # ─────────────────────────────────────────────────────────────────────────────
 class PollWorker:
     def __init__(self, signals: WorkerSignals):
-        self.signals    = signals
-        self.stop_evt   = Event()
-        self._thread    = None
-        self.sim_mode   = False
-        self.client     = None
+        self.signals   = signals
+        self.stop_evt  = Event()
+        self._thread   = None
+        self.sim_mode  = True
+        self._sim      = SimSource()
 
-        # Mirrored params (set by GUI thread)
-        self.ton_us     = 10
-        self.capture_us = 20
-
-        # Sim counters
-        self._pulse_cnt = 0
-        self._wave_cnt  = 0
-
-    # ── public API (called from GUI thread) ───────────────────────────────────
-    def start(self, host: str, port: int, sim: bool):
+    def start(self, host: str, sim: bool):
         self.stop()
-        self.sim_mode   = sim
-        self._host      = host
-        self._port      = port
+        self.sim_mode = sim
+        self._host    = host
         self.stop_evt.clear()
-        self._thread    = Thread(target=self._run, daemon=True)
+        self._thread  = Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self):
         self.stop_evt.set()
         if self._thread:
             self._thread.join(timeout=2)
-        if self.client:
-            try: self.client.close()
-            except: pass
-            self.client = None
 
-    def write_param(self, reg: int, value: int):
-        """Write a single holding register (no-op in sim mode)."""
+    def send_cmd(self, cmd: dict):
         if self.sim_mode:
-            self._apply_sim_param(reg, value)
+            self._apply_sim_cmd(cmd)
             return
-        if self.client and self.client.connected:
-            self.client.write_register(reg, value)
+        if hasattr(self, '_sock') and self._sock:
+            try:
+                self._sock.sendall(json.dumps(cmd).encode() + b'\n')
+            except Exception:
+                pass
 
-    def _apply_sim_param(self, reg, value):
-        if reg == REG_TON_US:
-            self.ton_us = value
-        elif reg == REG_CAPTURE_US:
-            self.capture_us = value
+    def _apply_sim_cmd(self, cmd):
+        c = cmd.get('cmd', '')
+        v = cmd.get('value', 0)
+        if c == 'set_ton':
+            self._sim.ton_us = int(v)
+        elif c == 'set_toff':
+            self._sim.toff_us = int(v)
+        elif c == 'set_enable':
+            self._sim.enable = bool(v)
 
-    # ── worker loop ───────────────────────────────────────────────────────────
     def _run(self):
         if self.sim_mode:
             self._run_sim()
         else:
-            self._run_modbus()
+            self._run_network()
 
     def _run_sim(self):
         self.signals.connection_ok.emit(True)
-        period_us = self.ton_us + max(10, self.ton_us * 9)  # 10 % duty sim
-        t_next    = time.time()
-
         while not self.stop_evt.is_set():
-            now = time.time()
-            if now >= t_next:
-                gen = SimWaveform(self.ton_us, self.capture_us)
-                t, ch1, ch2 = gen.generate()
-                self._pulse_cnt += 1
-                self._wave_cnt  += 1
-                self.signals.waveform_ready.emit(t, ch1, ch2)
-                self.signals.status_update.emit(self._pulse_cnt, self._wave_cnt)
-                t_next = now + (self.ton_us + self.ton_us * 9) / 1e6 * 1000
-                # Clamp to at least 100 ms between waveforms for readability
-                t_next = max(t_next, now + 0.1)
-            time.sleep(0.01)
+            ch1, ch2 = self._sim.sample()
+            ts = time.time()
+            self.signals.sample_ready.emit(ch1, ch2, ts)
+            self.signals.status_update.emit({
+                'pulse_count': self._sim.pulse_count,
+                'hv_enable':   1,
+                'enable':      int(self._sim.enable),
+                'temp':        45.0,
+            })
+            time.sleep(0.005)
 
-    def _run_modbus(self):
-        if not MODBUS_AVAILABLE:
-            self.signals.error.emit("pymodbus not installed")
-            return
+    def _run_network(self):
+        self._sock = None
         try:
-            self.client = ModbusTcpClient(self._host, port=self._port, timeout=3)
-            if not self.client.connect():
-                self.signals.connection_ok.emit(False)
-                self.signals.error.emit(f"Cannot connect to {self._host}:{self._port}")
-                return
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._sock.settimeout(5)
+            self._sock.connect((self._host, SERVER_PORT))
+            self._sock.settimeout(2)
             self.signals.connection_ok.emit(True)
         except Exception as e:
             self.signals.connection_ok.emit(False)
-            self.signals.error.emit(str(e))
+            self.signals.error.emit(f"Cannot connect to {self._host}:{SERVER_PORT}: {e}")
             return
 
-        # Start waveform stream receiver in a separate thread
-        stream_thread = Thread(target=self._run_stream, daemon=True)
-        stream_thread.start()
-
-        while not self.stop_evt.is_set():
+        buf = b''
+        try:
+            while not self.stop_evt.is_set():
+                try:
+                    data = self._sock.recv(4096)
+                    if not data:
+                        break
+                    buf += data
+                    while b'\n' in buf:
+                        line, buf = buf.split(b'\n', 1)
+                        try:
+                            d = json.loads(line)
+                            self.signals.sample_ready.emit(
+                                d.get('ch1', 0.0),
+                                d.get('ch2', 0.0),
+                                d.get('ts',  time.time()),
+                            )
+                            self.signals.status_update.emit(d)
+                        except Exception:
+                            pass
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+        finally:
             try:
-                rr = self.client.read_holding_registers(REG_PULSE_CNT, 2)
-                if not rr.isError():
-                    self.signals.status_update.emit(rr.registers[0], rr.registers[1])
+                self._sock.close()
             except Exception:
                 pass
-            time.sleep(0.5)
-
-        self.client.close()
-        stream_thread.join(timeout=2)
-
-    def _run_stream(self):
-        """Connect to waveform_manager TCP stream and receive waveform frames."""
-        while not self.stop_evt.is_set():
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(3)
-                sock.connect((self._host, STREAM_PORT))
-                sock.settimeout(None)
-            except Exception as e:
-                self.signals.error.emit(f"Waveform stream: {e}")
-                time.sleep(3)
-                continue
-
-            try:
-                while not self.stop_evt.is_set():
-                    # Read 4-byte header: n_samples
-                    header = self._recv_exact(sock, 4)
-                    if header is None:
-                        break
-                    n = struct.unpack("<I", header)[0]
-                    if n == 0 or n > 1_000_000:
-                        break
-
-                    body = self._recv_exact(sock, n * 8)  # ch1 + ch2, float32 each
-                    if body is None:
-                        break
-
-                    ch1 = np.frombuffer(body[:n * 4], dtype=np.float32).copy()
-                    ch2 = np.frombuffer(body[n * 4:], dtype=np.float32).copy()
-                    t   = np.arange(n, dtype=np.float32) / 125.0  # µs at 125 MSPS
-                    self.signals.waveform_ready.emit(t, ch1, ch2)
-            except Exception:
-                pass
-            finally:
-                try: sock.close()
-                except: pass
-
-    @staticmethod
-    def _recv_exact(sock: socket.socket, n: int):
-        """Read exactly n bytes from sock; return None on connection loss."""
-        buf = bytearray()
-        while len(buf) < n:
-            try:
-                chunk = sock.recv(n - len(buf))
-            except Exception:
-                return None
-            if not chunk:
-                return None
-            buf.extend(chunk)
-        return bytes(buf)
+            self._sock = None
+            if not self.stop_evt.is_set():
+                self.signals.error.emit("Connection lost")
+                self.signals.connection_ok.emit(False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Waveform plot widget
+# Waveform plot widget — rolling time window
 # ─────────────────────────────────────────────────────────────────────────────
 class WaveformWidget(QWidget):
+    MAX_SAMPLES = 4000   # keep last 4000 samples (~20 s at 200 Hz)
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.fig = Figure(figsize=(6, 4), tight_layout=True)
+        self._ts   = deque(maxlen=self.MAX_SAMPLES)
+        self._ch1  = deque(maxlen=self.MAX_SAMPLES)
+        self._ch2  = deque(maxlen=self.MAX_SAMPLES)
+
+        self.fig = Figure(figsize=(7, 4), tight_layout=True)
+        self.fig.patch.set_facecolor('#1e1e1e')
         self.ax1, self.ax2 = self.fig.subplots(2, 1, sharex=True)
 
-        self.ax1.set_ylabel("Voltage (V)")
-        self.ax1.set_ylim(-5, 100)
-        self.ax1.grid(True, alpha=0.3)
-        self.ax1.set_title("CH1 – Gap Voltage", fontsize=9)
+        for ax in (self.ax1, self.ax2):
+            ax.set_facecolor('#1e1e1e')
+            ax.tick_params(colors='#cccccc', labelsize=8)
+            ax.grid(True, color='#333333', linewidth=0.5)
+            for spine in ax.spines.values():
+                spine.set_edgecolor('#444444')
 
-        self.ax2.set_ylabel("Current (A)")
-        self.ax2.set_xlabel("Time (µs)")
-        self.ax2.set_ylim(-0.5, 12)
-        self.ax2.grid(True, alpha=0.3)
-        self.ax2.set_title("CH2 – Arc Current", fontsize=9)
+        self.ax1.set_ylabel("Gap Voltage (V)", color='#cccccc', fontsize=8)
+        self.ax1.set_ylim(-2, 80)
+        self.ax1.set_title("CH1 – Gap Voltage", color='#cccccc', fontsize=9)
+        self.ax1.yaxis.label.set_color('#cccccc')
 
-        self.line1, = self.ax1.plot([], [], color="#2196F3", lw=0.8)
-        self.line2, = self.ax2.plot([], [], color="#F44336", lw=0.8)
+        self.ax2.set_ylabel("Arc Current proxy (V)", color='#cccccc', fontsize=8)
+        self.ax2.set_xlabel("Time (s)", color='#cccccc', fontsize=8)
+        self.ax2.set_ylim(-0.1, 3.5)
+        self.ax2.set_title("CH2 – Arc Current (GEDM output)", color='#cccccc', fontsize=9)
+        self.ax2.yaxis.label.set_color('#cccccc')
+
+        self.line1, = self.ax1.plot([], [], color='#2196F3', lw=0.8)
+        self.line2, = self.ax2.plot([], [], color='#F44336', lw=0.8)
 
         self.canvas = FigureCanvas(self.fig)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.canvas)
 
-    def update_waveform(self, t, ch1, ch2):
-        self.line1.set_data(t, ch1)
-        self.line2.set_data(t, ch2)
-        self.ax1.set_xlim(t[0], t[-1])
-        self.ax2.set_xlim(t[0], t[-1])
+    def add_sample(self, ch1: float, ch2: float, ts: float):
+        self._ts.append(ts)
+        self._ch1.append(ch1)
+        self._ch2.append(ch2)
+
+    def refresh(self):
+        if len(self._ts) < 2:
+            return
+        ts   = np.array(self._ts)
+        ch1  = np.array(self._ch1)
+        ch2  = np.array(self._ch2)
+
+        t_now  = ts[-1]
+        t_min  = t_now - WINDOW_SEC
+        mask   = ts >= t_min
+        t_rel  = ts[mask] - t_min   # seconds from left edge
+
+        self.line1.set_data(t_rel, ch1[mask])
+        self.line2.set_data(t_rel, ch2[mask])
+        self.ax1.set_xlim(0, WINDOW_SEC)
+        self.ax2.set_xlim(0, WINDOW_SEC)
         self.canvas.draw_idle()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Statistics panel (stub — expandable later)
+# Statistics panel
 # ─────────────────────────────────────────────────────────────────────────────
 class StatsWidget(QGroupBox):
     def __init__(self, parent=None):
         super().__init__("Statistics", parent)
-        form = QFormLayout(self)
-        self._v_peak  = QLabel("—")
-        self._i_peak  = QLabel("—")
-        self._energy  = QLabel("—")
-        self._rate    = QLabel("—")
-        form.addRow("V peak (V):", self._v_peak)
-        form.addRow("I peak (A):", self._i_peak)
-        form.addRow("Energy (µJ):", self._energy)
-        form.addRow("Pulse rate (Hz):", self._rate)
+        f = QFormLayout(self)
+        self._v_peak   = QLabel("—")
+        self._ch2_peak = QLabel("—")
+        self._rate     = QLabel("—")
+        self._temp     = QLabel("—")
+        f.addRow("V peak (V):",        self._v_peak)
+        f.addRow("CH2 peak (V):",      self._ch2_peak)
+        f.addRow("Pulse rate (Hz):",   self._rate)
+        f.addRow("Chip temp (°C):",    self._temp)
 
-        self._count = 0
+        self._last_pulse_count = 0
         self._t_start = time.time()
+        self._pulses_in_window = 0
 
-    def update(self, t, ch1, ch2):
-        self._count += 1
-        dt_us   = (t[-1] - t[0]) / (len(t) - 1) if len(t) > 1 else 0.008  # µs
-        v_peak  = float(np.max(ch1))
-        i_peak  = float(np.max(ch2))
-        energy  = float(np.trapz(ch1 * ch2, t))  # V·A·µs = µJ
+    def update(self, ch1_arr, ch2_arr, status: dict):
+        if len(ch1_arr):
+            self._v_peak.setText(f"{float(np.max(ch1_arr)):.1f}")
+            self._ch2_peak.setText(f"{float(np.max(ch2_arr)):.3f}")
 
+        pcnt = status.get('pulse_count', 0)
+        dp   = pcnt - self._last_pulse_count
+        self._last_pulse_count = pcnt
+        if dp > 0:
+            self._pulses_in_window += dp
         elapsed = time.time() - self._t_start
-        rate    = self._count / elapsed if elapsed > 0 else 0
+        if elapsed > 1.0:
+            self._rate.setText(f"{self._pulses_in_window / elapsed:.1f}")
+            if elapsed > 10:
+                self._pulses_in_window = 0
+                self._t_start = time.time()
 
-        self._v_peak.setText(f"{v_peak:.1f}")
-        self._i_peak.setText(f"{i_peak:.2f}")
-        self._energy.setText(f"{energy:.1f}")
-        self._rate.setText(f"{rate:.1f}")
+        temp = status.get('temp')
+        if temp is not None:
+            self._temp.setText(f"{temp:.1f}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -346,20 +330,26 @@ class StatsWidget(QGroupBox):
 class OperatorConsole(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("EDM Controller – Operator Console")
-        self.resize(1100, 620)
+        self.setWindowTitle("EDM Controller – PYNQ-Z2")
+        self.resize(1200, 660)
 
         self._signals = WorkerSignals()
         self._worker  = PollWorker(self._signals)
+        self._last_status: dict = {}
 
-        self._signals.waveform_ready.connect(self._on_waveform)
+        self._signals.sample_ready.connect(self._on_sample)
         self._signals.status_update.connect(self._on_status)
         self._signals.connection_ok.connect(self._on_connection)
         self._signals.error.connect(self._on_error)
 
         self._build_ui()
 
-    # ── UI construction ───────────────────────────────────────────────────────
+        self._plot_timer = QTimer(self)
+        self._plot_timer.timeout.connect(self._refresh_plot)
+        self._plot_timer.start(PLOT_REFRESH_MS)
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -368,64 +358,54 @@ class OperatorConsole(QMainWindow):
 
         # ── Left panel ────────────────────────────────────────────────────────
         left = QVBoxLayout()
-        left.setSpacing(8)
+        left.setSpacing(6)
         root.addLayout(left, stretch=0)
 
         # Connection
-        conn_box = QGroupBox("Connection")
-        cf = QFormLayout(conn_box)
+        cbox = QGroupBox("Connection")
+        cf   = QFormLayout(cbox)
         self._host_edit = QLineEdit(DEFAULT_HOST)
-        self._port_edit = QLineEdit(str(DEFAULT_PORT))
         self._sim_chk   = QCheckBox("Simulation mode")
         self._sim_chk.setChecked(True)
         self._conn_btn  = QPushButton("Connect")
         self._conn_btn.setCheckable(True)
         self._conn_btn.clicked.connect(self._toggle_connect)
-        cf.addRow("Host:", self._host_edit)
-        cf.addRow("Port:", self._port_edit)
-        cf.addRow("", self._sim_chk)
-        cf.addRow("", self._conn_btn)
-        left.addWidget(conn_box)
+        cf.addRow("Board IP:", self._host_edit)
+        cf.addRow("",          self._sim_chk)
+        cf.addRow("",          self._conn_btn)
+        left.addWidget(cbox)
 
         # Parameters
-        param_box = QGroupBox("Parameters")
-        pf = QFormLayout(param_box)
-
-        self._ton_spin     = self._make_spin(1, 10000, 10,  "µs")
-        self._toff_spin    = self._make_spin(1, 100000, 90, "µs")
-        self._capture_spin = self._make_spin(1, 10000, 20,  "µs")
-        self._fsave_spin   = self._make_dspin(0, 100, 1.00,  "%")
-        self._fdisp_spin   = self._make_dspin(0, 100, 10.00, "%")
-        self._enable_btn   = QPushButton("Enable Pulses")
+        pbox = QGroupBox("Parameters")
+        pf   = QFormLayout(pbox)
+        self._ton_spin  = QSpinBox(); self._ton_spin.setRange(1, 10000);  self._ton_spin.setValue(10);  self._ton_spin.setSuffix(" µs")
+        self._toff_spin = QSpinBox(); self._toff_spin.setRange(1, 100000); self._toff_spin.setValue(90); self._toff_spin.setSuffix(" µs")
+        self._enable_btn = QPushButton("Enable Pulses")
         self._enable_btn.setCheckable(True)
         self._enable_btn.setStyleSheet(
-            "QPushButton:checked { background-color: #4CAF50; color: white; font-weight: bold; }"
+            "QPushButton:checked { background-color: #c62828; color: white; font-weight: bold; }"
         )
         self._enable_btn.clicked.connect(self._on_enable)
-
-        pf.addRow("Ton (µs):",       self._ton_spin)
-        pf.addRow("Toff (µs):",      self._toff_spin)
-        pf.addRow("Capture (µs):",   self._capture_spin)
-        pf.addRow("Save fraction:",  self._fsave_spin)
-        pf.addRow("Disp fraction:",  self._fdisp_spin)
-        pf.addRow("",                self._enable_btn)
-
-        apply_btn = QPushButton("Apply Parameters")
+        apply_btn = QPushButton("Apply")
         apply_btn.clicked.connect(self._apply_params)
-        pf.addRow("", apply_btn)
-        left.addWidget(param_box)
+        pf.addRow("Ton:",  self._ton_spin)
+        pf.addRow("Toff:", self._toff_spin)
+        pf.addRow("",      apply_btn)
+        pf.addRow("",      self._enable_btn)
+        left.addWidget(pbox)
 
         # Status
-        status_box = QGroupBox("Status")
-        sf = QFormLayout(status_box)
-        self._lbl_pulse = QLabel("—")
-        self._lbl_wave  = QLabel("—")
-        self._lbl_conn  = QLabel("Disconnected")
-        self._lbl_conn.setStyleSheet("color: gray;")
-        sf.addRow("Pulse count:", self._lbl_pulse)
-        sf.addRow("Wave count:",  self._lbl_wave)
-        sf.addRow("Link:",        self._lbl_conn)
-        left.addWidget(status_box)
+        sbox = QGroupBox("Status")
+        sf   = QFormLayout(sbox)
+        self._lbl_conn   = QLabel("Disconnected"); self._lbl_conn.setStyleSheet("color: gray;")
+        self._lbl_pulse  = QLabel("—")
+        self._lbl_hven   = QLabel("—")
+        self._lbl_enable = QLabel("—")
+        sf.addRow("Link:",         self._lbl_conn)
+        sf.addRow("Pulse count:",  self._lbl_pulse)
+        sf.addRow("HV switch:",    self._lbl_hven)
+        sf.addRow("Sparks:",       self._lbl_enable)
+        left.addWidget(sbox)
 
         left.addStretch()
 
@@ -439,90 +419,77 @@ class OperatorConsole(QMainWindow):
         self._stats_widget = StatsWidget()
         right.addWidget(self._stats_widget, stretch=0)
 
-        # Status bar
-        self.statusBar().showMessage("Ready — enable Simulation mode and click Connect")
-
-    # ── helpers ───────────────────────────────────────────────────────────────
-    @staticmethod
-    def _make_spin(lo, hi, val, suffix=""):
-        s = QSpinBox()
-        s.setRange(lo, hi)
-        s.setValue(val)
-        s.setSuffix(f" {suffix}" if suffix else "")
-        s.setMinimumWidth(90)
-        return s
-
-    @staticmethod
-    def _make_dspin(lo, hi, val, suffix=""):
-        s = QDoubleSpinBox()
-        s.setRange(lo, hi)
-        s.setValue(val)
-        s.setDecimals(2)
-        s.setSuffix(f" {suffix}" if suffix else "")
-        s.setMinimumWidth(90)
-        return s
+        self.statusBar().showMessage("Enable Simulation mode and click Connect, or enter board IP and connect to hardware.")
 
     # ── slots ─────────────────────────────────────────────────────────────────
+
     def _toggle_connect(self, checked: bool):
         if checked:
             self._conn_btn.setText("Disconnect")
-            host = self._host_edit.text().strip()
-            port = int(self._port_edit.text().strip())
-            sim  = self._sim_chk.isChecked()
             self._host_edit.setEnabled(False)
-            self._port_edit.setEnabled(False)
             self._sim_chk.setEnabled(False)
-            self._worker.start(host, port, sim)
+            self._worker.start(self._host_edit.text().strip(), self._sim_chk.isChecked())
         else:
             self._conn_btn.setText("Connect")
             self._worker.stop()
             self._lbl_conn.setText("Disconnected")
             self._lbl_conn.setStyleSheet("color: gray;")
             self._host_edit.setEnabled(True)
-            self._port_edit.setEnabled(True)
             self._sim_chk.setEnabled(True)
-            self.statusBar().showMessage("Disconnected")
+            self.statusBar().showMessage("Disconnected.")
 
     def _on_enable(self, checked: bool):
         self._enable_btn.setText("Disable Pulses" if checked else "Enable Pulses")
-        self._worker.write_param(REG_ENABLE, 1 if checked else 0)
+        self._worker.send_cmd({'cmd': 'set_enable', 'value': 1 if checked else 0})
 
     def _apply_params(self):
-        ton      = self._ton_spin.value()
-        toff     = self._toff_spin.value()
-        cap      = self._capture_spin.value()
-        f_save   = int(round(self._fsave_spin.value() * 100))   # → 0-10000
-        f_disp   = int(round(self._fdisp_spin.value() * 100))
+        ton  = self._ton_spin.value()
+        toff = self._toff_spin.value()
+        self._worker.send_cmd({'cmd': 'set_ton',  'value': ton})
+        self._worker.send_cmd({'cmd': 'set_toff', 'value': toff})
+        self.statusBar().showMessage(f"Parameters applied: Ton={ton}µs  Toff={toff}µs")
 
-        self._worker.ton_us     = ton
-        self._worker.capture_us = cap
+    def _on_sample(self, ch1: float, ch2: float, ts: float):
+        self._wave_widget.add_sample(ch1, ch2, ts)
 
-        self._worker.write_param(REG_TON_US,     ton)
-        self._worker.write_param(REG_TOFF_US,    toff)
-        self._worker.write_param(REG_CAPTURE_US, cap)
-        self._worker.write_param(REG_FSAVE,      f_save)
-        self._worker.write_param(REG_FDISPLAY,   f_disp)
-        self.statusBar().showMessage(
-            f"Parameters applied: Ton={ton}µs  Toff={toff}µs  Cap={cap}µs"
-        )
+    def _on_status(self, d: dict):
+        self._last_status = d
+        self._lbl_pulse.setText(str(d.get('pulse_count', '—')))
 
-    def _on_waveform(self, t, ch1, ch2):
-        self._wave_widget.update_waveform(t, ch1, ch2)
-        self._stats_widget.update(t, ch1, ch2)
+        hven = d.get('hv_enable')
+        if hven is not None:
+            if hven:
+                self._lbl_hven.setText("ON")
+                self._lbl_hven.setStyleSheet("color: #F44336; font-weight: bold;")
+            else:
+                self._lbl_hven.setText("OFF")
+                self._lbl_hven.setStyleSheet("color: #4CAF50;")
 
-    def _on_status(self, pulse_cnt: int, wave_cnt: int):
-        self._lbl_pulse.setText(str(pulse_cnt))
-        self._lbl_wave.setText(str(wave_cnt))
+        en = d.get('enable')
+        if en is not None:
+            if en:
+                self._lbl_enable.setText("RUNNING")
+                self._lbl_enable.setStyleSheet("color: #F44336; font-weight: bold;")
+            else:
+                self._lbl_enable.setText("Stopped")
+                self._lbl_enable.setStyleSheet("color: #888888;")
+
+    def _refresh_plot(self):
+        self._wave_widget.refresh()
+        w  = self._wave_widget
+        ch1 = np.array(w._ch1)
+        ch2 = np.array(w._ch2)
+        self._stats_widget.update(ch1, ch2, self._last_status)
 
     def _on_connection(self, ok: bool):
         if ok:
             mode = "Simulation" if self._sim_chk.isChecked() else "Hardware"
             self._lbl_conn.setText(f"Connected ({mode})")
             self._lbl_conn.setStyleSheet("color: #4CAF50; font-weight: bold;")
-            self.statusBar().showMessage(f"{mode} mode active")
+            self.statusBar().showMessage(f"{mode} mode active.")
         else:
-            self._lbl_conn.setText("Failed")
-            self._lbl_conn.setStyleSheet("color: #F44336;")
+            self._lbl_conn.setText("Disconnected")
+            self._lbl_conn.setStyleSheet("color: gray;")
 
     def _on_error(self, msg: str):
         self.statusBar().showMessage(f"Error: {msg}")
