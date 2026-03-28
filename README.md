@@ -1,6 +1,6 @@
 # EDM FPGA Controller
 
-FPGA-based EDM (Electrical Discharge Machining) pulse controller for the **Red Pitaya STEMlab 125-14** (Zynq-7010). Generates precise Ton/Toff pulse sequences, captures voltage and current waveforms via the on-board ADCs, streams them to DDR via AXI DMA, and exposes all parameters over Modbus TCP from the Zynq Linux PS.
+FPGA-based EDM (Electrical Discharge Machining) pulse controller for the **PYNQ-Z2** (Zynq-7020). Generates precise Ton/Toff pulse sequences, reads gap voltage and arc current via the on-board XADC, and exposes all parameters via PYNQ Python overlay API.
 
 ---
 
@@ -8,13 +8,15 @@ FPGA-based EDM (Electrical Discharge Machining) pulse controller for the **Red P
 
 | Item | Detail |
 |------|--------|
-| Board | Red Pitaya STEMlab 125-14 v1 |
-| SoC | Xilinx Zynq-7010 (XC7Z010-1CLG400C) |
-| PL clock | 125 MHz (FCLK0 from PS) |
-| ADC | 125 MSPS, 14-bit, two channels |
-| CH1 | Gap voltage (Hentek high-voltage probe) |
-| CH2 | Arc current (shunt resistor feedback) |
-| Pulse output | 3.3 V GPIO → GEDM pulseboard |
+| Board | PYNQ-Z2 |
+| SoC | Xilinx Zynq-7020 (XC7Z020-1CLG400C) |
+| PL clock | 100 MHz (FCLK0 from PS) |
+| ADC | XADC, 1 MSPS, 12-bit, two channels |
+| CH1 | Gap voltage — Hantek HV probe → VP/VN header (÷3 divider to 0–1V) |
+| CH2 | Arc current — GEDM optoisolated output (0–3.3V) → Arduino A0 (VAUX1, onboard divider) |
+| Pulse output | Arduino D2 → GEDM pulseboard |
+| HV enable | Arduino D3 ← operator toggle switch |
+| Warning lamps | Arduino D4/D5/D6 → HFET module (green/orange/red) |
 
 ---
 
@@ -44,52 +46,28 @@ edm_fpga/
 
 ## Register Map
 
-All registers are 32-bit, accessible via AXI4-Lite at base address `0x43C00000`.
+### EDM Control Registers — AXI4-Lite base address `0x43C00000`
 
 | Offset | Name | R/W | Default | Description |
 |--------|------|-----|---------|-------------|
-| 0x00 | `ton_cycles` | RW | 1250 | Ton duration in clock cycles (µs × 125) |
-| 0x04 | `toff_cycles` | RW | 11250 | Toff duration in clock cycles |
+| 0x00 | `ton_cycles` | RW | 1000 | Ton duration in clock cycles (µs × 100) |
+| 0x04 | `toff_cycles` | RW | 9000 | Toff duration in clock cycles |
 | 0x08 | `enable` | RW | 0 | bit[0]: 1 = run, 0 = stop |
-| 0x0C | `capture_len` | RW | 2500 | Waveform capture length in samples |
-| 0x10 | `f_save` | RW | 100 | Fraction to save to HDF5 (0–10000 = 0–100.00%) |
-| 0x14 | `f_display` | RW | 1000 | Fraction to display live (0–10000) |
-| 0x18 | `pulse_count` | RO | — | Running count of pulses fired |
-| 0x1C | `waveform_count` | RO | — | Running count of waveforms captured |
+| 0x0C | `pulse_count` | RO | — | Running count of pulses fired |
+| 0x10 | `hv_enable` | RO | — | bit[0]: operator HV enable switch state |
+
+### XADC Wizard Registers — AXI4-Lite base address `0x43C20000`
+
+Standard Xilinx XADC Wizard register map. Key offsets:
+
+| Offset | Description |
+|--------|-------------|
+| 0x200 | Temperature |
+| 0x204 | VCCINT |
+| 0x240 | VP/VN (CH1, gap voltage) |
+| 0x250 | VAUX1 (CH2, arc current, Arduino A0) |
 
 ---
-
-## Waveform Data Format
-
-Each AXI-Stream word (32 bits) contains one sample pair:
-
-```
-[31:18]  CH1 (14-bit, gap voltage, 2's complement)
-[17:16]  00 (unused)
-[15:2]   CH2 (14-bit, arc current, 2's complement)
-[ 1:0]   00 (unused)
-```
-
-TLAST asserts on the final sample of each waveform. Waveforms are transferred to DDR via AXI DMA (S2MM, simple mode).
-
----
-
-## Modbus TCP Interface
-
-The PS-side `modbus_server.py` translates Modbus holding registers to AXI register writes via `/dev/mem`.
-
-| Modbus Register | Parameter | Units |
-|-----------------|-----------|-------|
-| 0 | Ton | µs |
-| 1 | Toff | µs |
-| 2 | Enable | 0/1 |
-| 3 | Capture window | µs |
-| 4 | f_save | 0–10000 |
-| 5 | f_display | 0–10000 |
-| 6 (read) | pulse_count | — |
-| 7 (read) | waveform_count | — |
-
-Default port: **502**.
 
 ---
 
@@ -98,10 +76,11 @@ Default port: **502**.
 Requires Vivado 2023.2.
 
 ```bash
-vivado -mode batch -source scripts/create_project.tcl
+cd /home/sonnensn/edm-fpga
+/tools/Xilinx/Vivado/2023.2/bin/vivado -mode batch -source scripts/create_project.tcl
 ```
 
-Output: `~/edm_fpga/edm_rp.bit`
+Output: `edm_pynq.bit`
 
 ### Out-of-Context Synthesis Check
 
@@ -180,13 +159,13 @@ cat /root/edm_rp.bit > /dev/xdevcfg
 
 ## Status
 
-- [x] RTL design complete
-- [x] xsim simulation — all tests passing
+- [x] RTL design ported to PYNQ-Z2 (Zynq-7020, 100 MHz)
 - [x] Vivado block design and bitstream generation script
-- [x] Modbus TCP server
-- [x] HDF5 waveform storage
-- [x] Operator console with simulation mode
-- [ ] Hardware bring-up (board on order)
-- [ ] Verify XDC pin assignments against RP v1 schematic
-- [ ] Calibrate CH1 probe attenuation and CH2 shunt resistor scaling
-- [ ] CH2 input voltage divider (3.3 V → 0.9 V for RP ADC)
+- [x] XADC Wizard integration (VP/VN + VAUX1)
+- [x] HV enable switch input with 2-FF synchroniser
+- [x] Warning lamp logic (green/orange/red)
+- [ ] Build and verify bitstream
+- [ ] Verify XDC pin assignments against PYNQ-Z2 schematic
+- [ ] PYNQ Python overlay driver
+- [ ] Hardware bring-up and ADC calibration
+- [ ] High-speed waveform capture (deferred — requires parallel ADC on RPi header)

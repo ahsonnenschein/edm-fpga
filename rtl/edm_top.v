@@ -1,13 +1,16 @@
 `timescale 1ns/1ps
 // edm_top.v
-// Top-level EDM FPGA controller for Red Pitaya STEMlab 125-14 (Zynq-7010)
+// Top-level EDM FPGA controller for PYNQ-Z2 (Zynq-7020)
 //
 // Connections:
-//   axi_*        : AXI4-Lite from Zynq PS GP0 (control registers)
-//   m_axis_*     : AXI4-Stream to AXI DMA (waveform data to DDR)
-//   adc_ch1/ch2  : 14-bit ADC data from Red Pitaya ADC (registered in IOB)
-//   pulse_out    : 3.3V GPIO to GEDM pulseboard logic input
-//   led          : status LEDs
+//   axi_*      : AXI4-Lite from Zynq PS GP0 (control registers)
+//   hv_enable  : Operator HV enable switch input (Arduino D3, active high)
+//   pulse_out  : 3.3V GPIO to GEDM pulseboard (Arduino D2)
+//   lamp_*     : Warning light outputs via HFET module (Arduino D4/D5/D6)
+//   led        : Status LEDs (LD0-LD3)
+//
+// Note: ADC waveform capture is handled by the PS via XADC Wizard AXI reads.
+// High-speed waveform capture will be added when the parallel ADC is connected.
 
 module edm_top #(
     parameter C_S_AXI_DATA_WIDTH = 32,
@@ -36,21 +39,19 @@ module edm_top #(
     output wire                             S_AXI_RVALID,
     input  wire                             S_AXI_RREADY,
 
-    // AXI4-Stream master (to AXI DMA, waveform samples → DDR)
-    output wire [31:0] m_axis_tdata,
-    output wire        m_axis_tvalid,
-    output wire        m_axis_tlast,
-    input  wire        m_axis_tready,
+    // Operator HV enable switch (Arduino D3, active high)
+    input  wire        hv_enable,
 
-    // Red Pitaya ADC interface (125 MSPS, 14-bit)
-    input  wire [13:0] adc_ch1_i,   // CH1: voltage (Hentek probe)
-    input  wire [13:0] adc_ch2_i,   // CH2: current feedback
-
-    // EDM pulse output → GEDM pulseboard (3.3V GPIO)
+    // EDM pulse output → GEDM pulseboard (Arduino D2)
     output wire        pulse_out,
 
-    // Status LEDs
-    output wire [7:0]  led
+    // Warning lamp outputs → HFET module (Arduino D4/D5/D6)
+    output wire        lamp_green,   // HV enable switch OFF
+    output wire        lamp_orange,  // Switch ON, sparks OFF
+    output wire        lamp_red,     // Sparks ON
+
+    // Status LEDs (LD0-LD3)
+    output wire [3:0]  led
 );
 
 // -------------------------------------------------------
@@ -59,22 +60,20 @@ module edm_top #(
 wire [31:0] ton_cycles;
 wire [31:0] toff_cycles;
 wire        enable;
-wire [31:0] capture_len;
-wire [15:0] f_save;
-wire [15:0] f_display;
 wire [31:0] pulse_count;
-wire [31:0] waveform_count;
 
 wire        trigger;
-wire        capturing;
+wire        pulse_internal;
 
-// Register ADC inputs in IOB (minimise input delay)
-reg [13:0] adc_ch1_reg;
-reg [13:0] adc_ch2_reg;
+// Synchronise hv_enable input to AXI clock domain (2-FF synchroniser)
+reg hv_enable_r1, hv_enable_sync;
 always @(posedge S_AXI_ACLK) begin
-    adc_ch1_reg <= adc_ch1_i;
-    adc_ch2_reg <= adc_ch2_i;
+    hv_enable_r1   <= hv_enable;
+    hv_enable_sync <= hv_enable_r1;
 end
+
+// Gate pulse output: only fire when operator has enabled HV
+assign pulse_out = pulse_internal & hv_enable_sync;
 
 // -------------------------------------------------------
 // AXI-Lite register file
@@ -107,11 +106,8 @@ axi_edm_regs #(
     .ton_cycles      (ton_cycles),
     .toff_cycles     (toff_cycles),
     .enable          (enable),
-    .capture_len     (capture_len),
-    .f_save          (f_save),
-    .f_display       (f_display),
     .pulse_count     (pulse_count),
-    .waveform_count  (waveform_count)
+    .hv_enable_in    (hv_enable_sync)
 );
 
 // -------------------------------------------------------
@@ -120,38 +116,30 @@ axi_edm_regs #(
 edm_pulse_ctrl u_pulse (
     .clk         (S_AXI_ACLK),
     .rst_n       (S_AXI_ARESETN),
-    .enable      (enable),
+    .enable      (enable & hv_enable_sync),
     .ton_cycles  (ton_cycles),
     .toff_cycles (toff_cycles),
-    .pulse_out   (pulse_out),
+    .pulse_out   (pulse_internal),
     .trigger     (trigger),
     .pulse_count (pulse_count)
 );
 
 // -------------------------------------------------------
-// Waveform capture
+// Warning lamp logic (combinational)
+//   green  = HV switch off
+//   orange = switch on, sparks disabled
+//   red    = sparks actively running
 // -------------------------------------------------------
-waveform_capture u_capture (
-    .clk            (S_AXI_ACLK),
-    .rst_n          (S_AXI_ARESETN),
-    .trigger        (trigger),
-    .adc_ch1        (adc_ch1_reg),
-    .adc_ch2        (adc_ch2_reg),
-    .capture_len    (capture_len),
-    .m_axis_tdata   (m_axis_tdata),
-    .m_axis_tvalid  (m_axis_tvalid),
-    .m_axis_tlast   (m_axis_tlast),
-    .m_axis_tready  (m_axis_tready),
-    .capturing      (capturing),
-    .waveform_count (waveform_count)
-);
+assign lamp_green  = ~hv_enable_sync;
+assign lamp_orange =  hv_enable_sync & ~enable;
+assign lamp_red    =  hv_enable_sync &  enable;
 
 // -------------------------------------------------------
-// Status LEDs
+// Status LEDs (PYNQ-Z2 board LEDs LD0-LD3)
 // -------------------------------------------------------
 assign led[0] = enable;
 assign led[1] = pulse_out;
-assign led[2] = capturing;
-assign led[7:3] = 5'b0;
+assign led[2] = hv_enable_sync;
+assign led[3] = lamp_red;
 
 endmodule
