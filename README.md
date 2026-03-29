@@ -22,11 +22,11 @@ FPGA-based EDM (Electrical Discharge Machining) pulse controller running on the 
 | ADC | On-chip XADC, simultaneous sampling, 500 kSPS per channel, 12-bit |
 | CH1 | Gap voltage — VP/VN dedicated differential input (÷3 resistor divider, 0–1 V range) |
 | CH2 | Arc current — GEDM optoisolated output (0–3.3 V) → VAUXP1/VAUXN1 |
-| Pulse output | Arduino D2 (T14) → GEDM pulse board |
-| HV enable input | Arduino D3 (U12) ← operator toggle switch |
-| Green lamp | Arduino D4 (U13) — HV off |
-| Orange lamp | Arduino D5 (V13) — HV on, sparks off |
-| Red lamp | Arduino D6 (V15) — sparks running |
+| Pulse output | Arduino AR2 (T14) → GEDM pulse board |
+| HV enable input | Arduino AR3 (U12) ← operator toggle switch |
+| Green lamp | Arduino AR4 (U13) — HV off |
+| Orange lamp | Arduino AR5 (V13) — HV on, sparks off |
+| Red lamp | Arduino AR6 (V15) — sparks running |
 | Status LEDs | LD0–LD3 (R14, P14, N16, M14) |
 | PSU serial | PYNQ-Z2 Raspberry Pi header pin 8 (TX) / pin 10 (RX) → DPH8909 TTL UART |
 
@@ -43,24 +43,26 @@ FPGA-based EDM (Electrical Discharge Machining) pulse controller running on the 
 
 CH1 scaling: `CH1_DIVIDER = 3.0` in `xadc_server.py` — adjust to match your resistor divider ratio.
 
-### Analog — Arduino header
+### Analog — Arduino analog header (AR_AN0–AR_AN5)
 
-| PYNQ-Z2 | Signal | Connect to |
-|---------|--------|------------|
-| A0 (AR_AN0_P) | VAUX1+ | Arc current sense + |
-| A1 (AR_AN0_N) | VAUX1− | Arc current sense − / GND |
+| Board label | Signal | Connect to |
+|-------------|--------|------------|
+| AR_AN0 | VAUX1+ | Arc current sense + |
+| AR_AN1 | VAUX1− | Arc current sense − / GND |
 
-### Digital — Arduino header (3.3 V LVCMOS)
+### Digital — Arduino header J4, pins AR0–AR7 (3.3 V LVCMOS)
 
-| PYNQ-Z2 pin | Direction | Signal | Connect to |
+The PYNQ-Z2 labels Arduino digital pins as `AR0`–`AR13` (not `D0`–`D13`).
+
+| Board label | Direction | Signal | Connect to |
 |-------------|-----------|--------|------------|
-| D2 | OUT | `pulse_out` | GEDM pulseboard trigger in |
-| D3 | IN | `hv_enable` | HV enable switch (high = enabled; pull to GND when off) |
-| D4 | OUT | `lamp_green` | HFET module green lamp |
-| D5 | OUT | `lamp_orange` | HFET module orange lamp |
-| D6 | OUT | `lamp_red` | HFET module red lamp |
+| AR2 | OUT | `pulse_out` | GEDM pulseboard trigger in |
+| AR3 | IN | `hv_enable` | HV enable switch (high = enabled; pull to GND when off) |
+| AR4 | OUT | `lamp_green` | HFET module green lamp |
+| AR5 | OUT | `lamp_orange` | HFET module orange lamp |
+| AR6 | OUT | `lamp_red` | HFET module red lamp |
 
-> All digital I/O is 3.3 V.  Use level shifters if the GEDM pulseboard or HFET module require 5 V logic.  Never drive D3 above 3.3 V.
+> All digital I/O is 3.3 V.  Use level shifters if the GEDM pulseboard or HFET module require 5 V logic.  Never drive AR3 above 3.3 V.
 
 ### Serial — Raspberry Pi header (3.3 V)
 
