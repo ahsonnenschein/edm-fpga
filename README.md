@@ -43,12 +43,12 @@ FPGA-based EDM (Electrical Discharge Machining) pulse controller running on the 
 
 CH1 scaling: `CH1_DIVIDER = 3.0` in `xadc_server.py` — adjust to match your resistor divider ratio.
 
-### Analog — Arduino analog header (AR_AN0–AR_AN5)
+### Analog — Arduino analog header J1 (A0–A5)
 
 | Board label | Signal | Connect to |
 |-------------|--------|------------|
-| AR_AN0 | VAUX1+ | Arc current sense + |
-| AR_AN1 | VAUX1− | Arc current sense − / GND |
+| A0 | VAUX1+ | Arc current sense + |
+| A1 | VAUX1− | Arc current sense − / GND |
 
 ### Digital — Arduino header J4, pins AR0–AR7 (3.3 V LVCMOS)
 
