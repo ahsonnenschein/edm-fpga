@@ -34,12 +34,14 @@ FPGA-based EDM (Electrical Discharge Machining) pulse controller running on the 
 
 ## Wiring
 
-### Analog — XADC header (dedicated 6-pin connector on PYNQ-Z2)
+### Analog — XADC header (4-pin connector on PYNQ-Z2)
 
-| PYNQ-Z2 | Signal | Connect to |
-|---------|--------|------------|
-| XADC VP | Gap voltage + | Probe divider output + |
-| XADC VN | Gap voltage − | Probe divider output − / GND |
+| Pin label | Connect to |
+|-----------|------------|
+| VP | Probe divider output + |
+| VN | Probe divider output − / GND |
+| GND | Board GND |
+| XVREF | Leave unconnected (internal reference used) |
 
 CH1 scaling: `CH1_DIVIDER = 3.0` in `xadc_server.py` — adjust to match your resistor divider ratio.
 
