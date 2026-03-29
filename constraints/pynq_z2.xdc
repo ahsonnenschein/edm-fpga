@@ -28,6 +28,14 @@ set_property -dict {PACKAGE_PIN V13 IOSTANDARD LVCMOS33} [get_ports lamp_orange_
 set_property -dict {PACKAGE_PIN V15 IOSTANDARD LVCMOS33} [get_ports lamp_red_0]
 
 # -------------------------------------------------------
+# UART1 EMIO — DPH8909 PSU serial (Raspberry Pi header)
+# Pin 8  (GPIO14): TX out from PS  →  DPH8909 RX
+# Pin 10 (GPIO15): RX into PS      ←  DPH8909 TX
+# -------------------------------------------------------
+set_property -dict {PACKAGE_PIN V6 IOSTANDARD LVCMOS33} [get_ports uart1_txd]
+set_property -dict {PACKAGE_PIN Y6 IOSTANDARD LVCMOS33} [get_ports uart1_rxd]
+
+# -------------------------------------------------------
 # Status LEDs (LD0-LD3)
 # -------------------------------------------------------
 set_property -dict {PACKAGE_PIN R14 IOSTANDARD LVCMOS33} [get_ports {led_0[0]}]
