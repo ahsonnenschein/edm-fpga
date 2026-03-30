@@ -1,0 +1,530 @@
+================================================================================
+WAVEFORM CAPTURE FIRST-PERIOD ANOMALY — FULL INVESTIGATION REPORT
+================================================================================
+System:  EDM FPGA controller on PYNQ-Z2 (Zynq XC7Z020-1CLG400C)
+Date:    2026-03-30
+Status:  Root cause UNKNOWN; workaround applied (capture_len=47)
+Hours spent: ~8 hours across one session
+================================================================================
+
+
+1. PROBLEM STATEMENT
+================================================================================
+
+When capturing per-pulse waveforms with Ton=10us, Toff=90us (period=100us),
+the FIRST inter-pulse period in each DMA capture varies UNIFORMLY from 35 to
+78 samples, while all subsequent inter-pulse periods are rock-steady at exactly
+48 samples.
+
+The oscilloscope confirms real pulses are perfectly steady at 100us period.
+The anomaly is in the captured digital data only.
+
+The range of variation (78 - 35 = 43 samples) equals EXACTLY Toff expressed
+in samples (90us / 2.08us = 43). This is unlikely to be coincidental and
+strongly suggests the capture start time is uniformly distributed across one
+full pulse period.
+
+
+2. SYSTEM ARCHITECTURE
+================================================================================
+
+Signal path (XADC to software):
+
+  XADC Wizard (simultaneous sampling VP/VN + VAUX6, continuous mode)
+      | eoc_out, channel_out, do_out, drdy_out
+      v
+  xadc_drp_reader.v
+      | ch1_data[11:0], ch2_data[11:0], pair_ready (~480 kHz pulse)
+      v
+  waveform_capture.v (triggered capture with 32-deep FIFO)
+      | m_axis_tdata[31:0], m_axis_tvalid, m_axis_tlast, m_axis_tready
+      v
+  AXI DMA S2MM (simple mode) via AXI interconnect
+      | HP0 port (64-bit stride)
+      v
+  DDR buffer (CMA allocation)
+      | read by Python xadc_server.py
+      v
+  TCP JSON broadcast to operator console
+
+Trigger path:
+
+  edm_pulse_ctrl.v generates:
+    - pulse_out: HIGH during Ton, LOW during Toff (registered)
+    - trigger: 1-cycle pulse at each Ton start (registered)
+
+  edm_top.v connects:
+    - pulse_trigger = edm_pulse_ctrl.trigger
+    - pulse_out_external = pulse_internal & hv_enable_sync
+    - waveform_capture.trigger = pulse_trigger & hv_enable_sync
+    - waveform_capture.pulse_state = pulse_out_external
+
+  Both trigger and pulse_state derive from the same registered signals
+  in edm_pulse_ctrl, gated by the same hv_enable_sync. They transition
+  on the same clock edge.
+
+Capture FSM (waveform_capture.v):
+
+  The trigger condition is INSIDE the S_IDLE case:
+
+    case (state)
+        S_IDLE: begin
+            if (trig_rise && capture_len > 0 && m_axis_tready) begin
+                capturing <= 1'b1;
+                sample_cnt <= capture_len;
+                cap_len_lat <= capture_len;
+                samples_in <= 16'd0;
+                fifo_wr_ptr <= 0;
+                fifo_rd_ptr <= 0;
+                state <= S_POP;
+            end
+        end
+        ...
+    endcase
+
+  The capture can ONLY start when:
+    1. state == S_IDLE (previous capture fully completed)
+    2. trig_rise == 1 (pulse trigger firing)
+    3. capture_len > 0
+    4. m_axis_tready == 1 (DMA is armed and ready)
+
+  FIFO write: wire fifo_wr_en = pair_ready & capturing & ~fifo_full
+  FIFO stores: {ch1_data[11:0], ch2_data[11:0], ts_counter[6:0], pulse_state}
+
+DMA buffer format (32-bit words at 64-bit stride):
+
+  bits [31:20] = ch1[11:0]     (arc current ADC)
+  bits [19:16] = ts[6:3]       (diagnostic timestamp high nibble)
+  bits [15:4]  = ch2[11:0]     (gap voltage ADC)
+  bits [3:1]   = ts[2:0]       (diagnostic timestamp low 3 bits)
+  bit  [0]     = pulse_state   (1=Ton, 0=Toff)
+
+  Each sample output TWICE (HP0 dual-beat workaround).
+  Software reads every other uint32: buf[::2]
+
+Pulse controller (edm_pulse_ctrl.v):
+
+  Three states: IDLE -> TON -> TOFF -> TON -> ...
+  Ton = 1000 cycles = 10us at 100 MHz (verified by register readback)
+  Toff = 9000 cycles = 90us at 100 MHz (verified)
+  trigger asserted for exactly 1 cycle at each IDLE->TON and TOFF->TON
+
+Software DMA loop (xadc_server.py _dma_loop):
+
+  while running:
+      read capture_len from FPGA register
+      arm DMA: write STATUS (clear), DST_ADDR, LENGTH
+      phase 1: poll DMA status until non-idle (trigger fired)
+      phase 2: poll DMA status until complete (TLAST received)
+      read waveform_count, skip if unchanged
+      invalidate cache, numpy copy buffer
+      rate-limit: if < 10ms since last broadcast, continue to top
+      build JSON frame, broadcast to TCP clients
+
+
+3. KEY MEASUREMENTS
+================================================================================
+
+3.1 Actual XADC Sample Rate
+----------------------------
+Measured from stable inter-pulse periods: 48 samples per 100us period.
+  -> pair_ready rate = 48 / 100us = 480,769 Hz (not 500 kHz)
+  -> Matches: 100 MHz / (4 x 26 x 2 channels) = 480,769 Hz
+  -> Each sample interval = 2.08 us
+
+3.2 Timestamp Diagnostic
+--------------------------
+Added 7-bit prescaled counter (50 MHz tick = 20ns resolution) to each sample.
+Expected inter-sample delta = 208 clocks / 2 = 104 ticks.
+
+Results from 100 bursts of 200 samples:
+
+  First 50 samples per burst:
+    mean delta = 103.0, std = 8.5, anomalous (>10 from 104) = 1.8%
+
+  After sample 50:
+    mean delta = 102.6, std = 11.9, anomalous = 1.3%
+
+  Delta histogram (first 50):
+    104: 2403 occurrences (98%)
+    Other: 47 scattered values
+
+  Delta histogram (after 50):
+    104: 7400 occurrences (99%)
+    0: 99 occurrences (likely mod-128 wrap)
+
+CONCLUSION: pair_ready fires at a PERFECTLY CONSTANT 104-tick interval.
+
+3.3 XADC Calibration Gap
+--------------------------
+In EVERY capture, sample index 34 has an anomalous timestamp delta.
+Observed values: 120, 64, 56, 32, 112, 80, 72, 0 (varies per burst).
+
+This is consistent with XADC automatic calibration inserting extra conversion
+cycles approximately every 34 pair_ready events. The DRP reader ignores
+calibration channels (channel_out != VP/VN and != VAUX6), so pair_ready simply
+doesn't fire during calibration. This creates a timing gap.
+
+However, this does NOT explain the first-period anomaly (see section 4.4).
+
+3.4 First Period Statistics (100 bursts, cap_len=200)
+------------------------------------------------------
+  min=35, max=78, mean=55.5, std=14.1
+  Distribution: approximately uniform over [35, 78]
+
+Stable periods (2nd->3rd, 3rd->4th, etc.):
+  min=44, max=49, mean=48.0, std=0.6
+
+3.5 Voltage and Pulse State at Expected Second Pulse Position
+---------------------------------------------------------------
+For bursts with first_period > 50, samples 43-55 were examined:
+  - pulse_state = 0 for ALL samples
+  - ch1 (arc current) = 0.0 for ALL samples
+  - timestamp delta = 104 (normal)
+
+The XADC genuinely does not see a pulse at the expected position.
+The oscilloscope confirms the real pulse IS there.
+
+3.6 Waveform Count Between Reads
+----------------------------------
+Between consecutive received bursts, waveform_count advances by 3-4.
+This means 2-3 captures happen between software reads (some are skipped
+by the rate-limiter). This occurs BOTH with and without the DMA re-arm
+optimization.
+
+3.7 ts[0] Variation Across Captures
+--------------------------------------
+The timestamp at sample 0 varies across captures:
+  Values observed: 0, 3, 8, 11, 16, 19, 24, 27, 32, 35, 40, 43, 48, 51,
+                   59, 64, 72, 80, 88, 91, 96, 99, 104, 107, 112, 115, 120, 123
+
+If all captures started at the same trigger phase, ts[0] should be constant
+(modulo pair_ready phase jitter of ±104 ticks). The observed range spans the
+full 0-127 space.
+
+Since 48 samples x 104 ticks = 4992 = 39 x 128 exactly (integer multiple of
+the 7-bit wrap), ts[0] should advance by exactly 0 mod 128 per pulse period.
+Any variation proves the capture start phase varies.
+
+
+4. CHRONOLOGICAL INVESTIGATION — HYPOTHESES TESTED
+================================================================================
+
+4.1 Hypothesis: Wrong Sample Rate (Hour 1)
+--------------------------------------------
+Initial theory: display assumes 500 kSPS but actual rate is different.
+
+Test: Measured stable inter-pulse period = 48 samples per 100us.
+  -> Actual rate = 480 kSPS, not 500 kSPS
+  -> 50 samples at 480 kSPS = 104us (slightly > 100us period)
+  -> Second pulse sometimes caught at the boundary
+
+Finding: The sample rate mismatch explains why capture_len=50 sometimes
+catches the second pulse, but NOT why the position varies by 43 samples.
+With constant pair_ready, the boundary effect should be +/-1 sample.
+
+Result: PARTIALLY EXPLAINS symptom but not the core anomaly.
+
+4.2 Hypothesis: hv_enable Switch Bounce (Hour 2)
+--------------------------------------------------
+Theory: Physical switch on AR1 (hv_enable) bounces, causing pulse controller
+to reset and fire triggers at random phases.
+
+Test: Tied AR1 directly to 3.3V with a wire. No switch in the path.
+
+Data: 50 bursts collected.
+  First period: min=35, max=77, mean=55.2, std=11.1
+
+Result: ELIMINATED. Same distribution with AR1 hard-wired.
+
+4.3 Hypothesis: DMA Buffer Overwrite Race (Hours 3-4)
+------------------------------------------------------
+Theory: The immediate DMA re-arm after buffer read (lines 508-513) allows
+subsequent captures to overwrite the buffer. The rate-limiter skips broadcasts,
+causing the loop to read multiple captures per broadcast. The buffer contains
+the LAST capture, which started at a random trigger phase.
+
+Test: Removed the entire re-arm optimization. Deleted _skip_arm flag. DMA arms
+unconditionally at the top of each loop iteration. Buffer is NEVER written
+while software reads it.
+
+Data: 50 bursts collected.
+  First period: min=35, max=78, mean=53.6, std=12.4
+
+Result: ELIMINATED. Same distribution without re-arm. The buffer is not being
+overwritten between reads.
+
+Further evidence: waveform_count still advances by 3-4 between reads even
+without re-arm. This is because the rate-limiter causes the loop to read and
+discard multiple captures per broadcast cycle. But each read is from a FRESH
+capture (arm -> trigger -> complete -> read -> discard -> arm again).
+
+4.4 Hypothesis: XADC Calibration Gaps (Hours 4-6)
+---------------------------------------------------
+Theory: XADC calibration conversions (~every 34 samples) cause pair_ready gaps
+that drop samples, creating time discontinuities. With 7-bit timestamp (mod 128),
+a gap of N dropped pair_readys gives delta = 104*(1+N) mod 128, which aliases to
+various values making the gap invisible.
+
+If N pair_readys are dropped at sample 34, the pulse at sample ~48 (real time
+100us) would appear at captured sample (48 - N), explaining first periods < 48.
+
+Test: Replaced pair_ready-driven FIFO writes with a FIXED-RATE sample_tick
+(every 208 clocks = 480.769 kSPS). This is waveform_capture.v rev 9. The capture
+samples ch1/ch2/pulse_state at perfectly uniform intervals, completely independent
+of XADC pair_ready timing. XADC calibration gaps have zero effect.
+
+Build complications: Rev 9 initially failed to produce any output (wfc=0) because:
+  1. First attempt: built on a block design with corrupted XADC IP (from an attempt
+     to disable calibration that silently broke the XADC wizard)
+  2. Second attempt: used a `parameter` in the module declaration, which may conflict
+     with Vivado's block design module reference mechanism
+  3. Third attempt: changed to `localparam`, still wfc=0
+  4. Fourth attempt: fresh create_project.tcl build, rev 9 produced ONE capture
+     then got stuck (wfc=1, subsequent captures failed)
+
+After finally getting rev 9 working with a completely fresh block design:
+
+Data: 50 bursts of 200 samples collected.
+  First period: min=35, max=79, mean=57.2, std=13.8
+
+Result: ELIMINATED. Same distribution with fixed-rate sample_tick. The problem
+is NOT caused by XADC calibration gaps or irregular pair_ready timing.
+
+This was the most significant finding: it proves the issue is NOT in the
+sampling/timing path at all. The sample clock is irrelevant to the bug.
+
+4.5 Additional Build/Deploy Issues Encountered
+-------------------------------------------------
+During the investigation, several Vivado build issues were discovered:
+
+a) Vivado IP cache reuses stale OOC synthesis even after reset_run. The IP cache
+   at edm_pynq.cache/ip/ must be manually deleted before rebuilding.
+   (Wasted one full build cycle deploying old 25-bit FIFO instead of new 32-bit.)
+
+b) Setting XADC_OFFSET_AND_GAIN_CALIBRATION=false in simultaneous sampling mode
+   produces a "disabled parameter ignored" warning but SILENTLY CORRUPTS the XADC
+   IP. The XADC produces no valid data (temp=-270C, all channels zero).
+   (Caused two board crashes and wasted ~2 hours debugging.)
+
+c) The DMA pre-reset (writing to 0x40400000 before overlay load) causes a bus error
+   on fresh boot when no overlay is loaded yet. The MMIO access to unmapped PL space
+   crashes Python before any output is written.
+
+d) Overlay load sometimes fails with EIO, leaving the FPGA manager in an error state
+   that requires power cycling. The SLCR FPGA reset approach (writing 0x0F to 0x240)
+   sometimes helps but also sometimes causes EIO.
+
+
+5. WHAT THE DATA PROVES
+================================================================================
+
+1. The capture does NOT start at the same trigger phase every time.
+   Evidence: ts[0] varies across full range; first period varies by 43 samples.
+
+2. Sample 0 ALWAYS has pulse_state=1.
+   Evidence: Every burst starts with 4-5 consecutive pulse_state=1 samples.
+   This means the capture always starts during a Ton.
+
+3. pair_ready is constant.
+   Evidence: Timestamp deltas are 104 for 98%+ of samples.
+
+4. The variation range (43) = Toff in samples.
+   This strongly suggests uniform distribution over one pulse period.
+
+5. Subsequent periods are perfect (48 +/- 1).
+   Whatever causes the anomaly resolves after one period.
+
+6. The sampling clock doesn't matter.
+   Both pair_ready (variable due to calibration) and fixed-rate sample_tick
+   (perfectly uniform) produce the same first-period distribution.
+
+7. The DMA buffer is not being overwritten.
+   Removing the re-arm optimization doesn't change the result.
+
+8. ch1 voltage and pulse_state agree.
+   Where pulse_state=0, ch1=0 (no arc current). The XADC genuinely doesn't
+   see a pulse at the expected second position. This is not a pulse_state
+   bit error — the actual analog signal is absent at those sample times.
+
+
+6. THE CENTRAL MYSTERY
+================================================================================
+
+Given that:
+  - The FSM can only start a capture in S_IDLE
+  - S_IDLE requires trig_rise (pulse trigger)
+  - All triggers fire at Ton starts (verified by pulse controller code)
+  - pair_ready is constant (verified by timestamp)
+
+The capture MUST start at a Ton trigger. And the next Ton is always 48 samples
+later (at constant 480 kSPS). So the first period MUST be 47-48.
+
+Yet it varies from 35 to 78.
+
+The only logical explanation is that one of the premises is wrong:
+  (a) The FSM starts somewhere other than S_IDLE, OR
+  (b) trig_rise fires at times other than Ton starts, OR
+  (c) The captured data doesn't correspond to what the FSM produces, OR
+  (d) m_axis_tready has unexpected behavior that disrupts the capture
+
+The code analysis eliminates (a) and (b). The timestamp diagnostic largely
+eliminates (c). This leaves (d) as the primary suspect, but it has not been
+directly observed.
+
+
+7. UNTESTED HYPOTHESES
+================================================================================
+
+7.1 AXI DMA tready Phantom Captures
+--------------------------------------
+In AXI DMA S2MM simple mode, does m_axis_tready stay HIGH after transfer
+completion (with RS=1 still set)? If so, the waveform_capture could start
+phantom captures that complete before the software reads the buffer. The
+software would read whichever capture last completed.
+
+This would explain the uniform first-period distribution: the phantom capture
+starts at whatever trigger follows the previous completion, which is at a
+random phase of the pulse cycle relative to the DMA arm time.
+
+Test required: ILA capture of m_axis_tready around DMA completion events,
+or careful reading of Xilinx PG021 for the specific DMA IP version.
+
+7.2 FIFO BRAM Read/Write Hazard
+---------------------------------
+The synthesis report shows asymmetric port modes:
+  32 x 32(READ_FIRST) | W | 32 x 32(WRITE_FIRST) | R
+
+If simultaneous read-write to the same FIFO address returns stale data on
+one port, a corrupted sample could cascade into wrong pulse detection.
+
+Test required: Force distributed RAM synthesis or add explicit guards.
+
+7.3 AXI Interconnect Latency on tready
+-----------------------------------------
+m_axis_tready from the DMA passes through the AXI interconnect before reaching
+waveform_capture. If there's multi-cycle latency, tready could go HIGH several
+cycles after the DMA LENGTH write. If a trigger fires during this latency window,
+the waveform_capture might see tready=0 (stale) while the DMA thinks tready=1.
+
+Test required: ILA or simulation of the AXI interconnect path.
+
+
+8. RECOMMENDED NEXT STEPS
+================================================================================
+
+Priority 1: ILA (Integrated Logic Analyzer)
+  Add Vivado ILA core probing:
+    - pulse_trigger (1-cycle trigger from pulse controller)
+    - m_axis_tready (from DMA, at waveform_capture input)
+    - waveform_capture.state[1:0]
+    - waveform_capture.capturing
+    - waveform_capture.waveform_count[3:0]
+    - pulse_out
+
+  Trigger on state transitioning S_IDLE -> S_POP.
+  Capture 1024 clocks before and after trigger.
+  This would DEFINITIVELY show what tready and pulse_trigger are doing
+  at each capture start.
+
+Priority 2: Read Xilinx PG021
+  Determine exact m_axis_tready behavior in S2MM simple mode after completion.
+  Specifically: does tready deassert after TLAST, or does it stay HIGH?
+
+Priority 3: Simulation
+  Create a testbench that includes the AXI DMA BFM (bus functional model)
+  and waveform_capture. Simulate the exact arm-trigger-capture-complete-rearm
+  sequence and observe tready behavior cycle-by-cycle.
+
+
+9. WORKAROUND
+================================================================================
+
+Set capture_len = 47 (default in xadc_server.py).
+
+Since 47 < 48 (one period in samples), the capture window is shorter than
+one pulse period. The second pulse never appears in the captured data.
+
+For different Ton/Toff settings:
+  max_safe_capture_len = floor((Ton_us + Toff_us) / 2.08) - 1
+
+This eliminates the visual artifact but does not fix the root cause.
+
+
+10. FILE REFERENCES
+================================================================================
+
+RTL:
+  rtl/waveform_capture.v       Capture FSM, FIFO, trigger logic (rev 8)
+  rtl/edm_top.v                Top-level: trigger routing, pulse_state
+  rtl/edm_pulse_ctrl.v         Pulse generator, trigger output
+  rtl/xadc_drp_reader.v        XADC DRP interface, pair_ready generation
+  rtl/axi_edm_regs.v           AXI-Lite register file
+
+Software:
+  software/xadc_server.py      DMA loop, buffer readback, TCP server
+  software/diag_timestamp.py   Timestamp diagnostic analysis tool
+  software/operator_console.py PC-side GUI
+
+Build:
+  scripts/create_project.tcl   Vivado block design creation and build
+  scripts/rebuild.tcl          Incremental rebuild (OOC-aware)
+  constraints/pynq_z2.xdc      Pin assignments
+
+
+11. RAW DATA
+================================================================================
+
+11.1 First Period Distribution (100 bursts, cap_len=200, pair_ready based)
+
+  35: 10    43: 4     49: 5     55: 3     60: 7     66: 2     72: 4     78: 2
+  36: 1     44: 6     51: 1     56: 2     61: 2     67: 1     73: 1
+  37: 2     45: 3     53: 1     58: 1     62: 2     68: 2     74: 3
+  38: 2     46: 3     54: 1     59: 1     63: 1     69: 1     75: 5
+  39: 1     47: 2                          64: 3     70: 2     76: 5
+  40: 3     48: 2                                               77: 2
+  41: 1
+
+11.2 Stable Period Distribution (251 measurements)
+
+  44: 1     45: 3     46: 4     48: 221     49: 22
+
+11.3 Burst Example (first_period=71)
+
+  Samples 0-10:
+    pulse: [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
+    ch1:   [0, 0, 3.96, 4.91, 5.05, 5.11, 0, 0, 0, 0, 0]
+
+  Samples 43-55 (where second pulse SHOULD be):
+    pulse: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    ch1:   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+  Samples 69-78 (where second pulse ACTUALLY is):
+    pulse: [0, 0, 1, 1, 1, 1, 1, 0, 0, 0]
+    ch1:   [0, 0, 0, 0, 0, 4.75, 5.04, 5.1, 0, 0]
+
+  Third pulse at sample 119: period from 2nd = 48 (stable)
+
+11.4 Timestamp Deltas at Sample 34 (XADC calibration position)
+
+  Burst 1:  delta=80   -> if 1 dropped pair_ready: 104*2 mod 128 = 80  CHECK
+  Burst 2:  delta=72   -> if 12 dropped: 104*13 mod 128 = 72           CHECK
+  Burst 3:  delta=64   -> if 7 dropped: 104*8 mod 128 = 64             CHECK
+  Burst 4:  delta=56   -> if 2 dropped: 104*3 mod 128 = 56             CHECK
+  Burst 5:  delta=32   -> if 3 dropped: 104*4 mod 128 = 32             CHECK
+
+  All observed anomalous deltas match integer numbers of dropped pair_readys.
+
+11.5 Waveform Count Between Reads (with re-arm optimization removed)
+
+  Burst  1: wf=39997  dwf=-    fp=46
+  Burst  2: wf=40000  dwf=3    fp=77
+  Burst  3: wf=40003  dwf=3    fp=58
+  Burst  4: wf=40006  dwf=3    fp=48
+  Burst  5: wf=40009  dwf=3    fp=63
+  ...
+  (dwf consistently 3-4, fp still varies 35-78)
+
+================================================================================
+END OF REPORT
+================================================================================

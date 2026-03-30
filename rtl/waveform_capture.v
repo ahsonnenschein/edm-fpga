@@ -1,24 +1,24 @@
 `timescale 1ns/1ps
-// waveform_capture.v  (rev 9 — fixed-rate sample tick, immune to XADC calibration gaps)
+// waveform_capture.v  (rev 8 — diagnostic timestamp in padding bits)
 //
-// Rev 7-8 used pair_ready (from xadc_drp_reader) as the sample clock.
-// Problem: XADC inserts calibration conversions every ~34 pairs.  The DRP
-// reader ignores calibration channels, so pair_ready has periodic gaps.
-// These gaps shift the time axis, making pulse edges appear at wrong
-// positions in the captured data (first period varies 35-78 instead of 48).
+// Root cause of "dropped pair_ready" bug: pair_ready is a single-cycle pulse
+// from xadc_drp_reader (~500 kHz, every ~200 clocks).  When the DMA deasserts
+// tready during DDR burst writes, the old FSM was stuck waiting and missed
+// incoming pair_ready pulses — samples were silently lost.
 //
-// Fix: generate a fixed-rate sample_tick from a free-running counter
-// (every SAMPLE_PERIOD clocks, default 208 = 480.769 kSPS at 100 MHz).
-// The capture latches ch1_data/ch2_data/pulse_state on each tick.
-// Values may be 1-2 µs stale during calibration gaps, but this only
-// occurs during Toff where all signals are near zero.
+// Fix: a small synchronous FIFO (32 deep) buffers {ch1, ch2, pulse_state}
+// on every pair_ready while capturing.  The AXI-Stream output FSM drains
+// from the FIFO, decoupled from XADC timing.  DMA burst pauses (~16 beats)
+// are fully absorbed.
 //
-// The FIFO and HP0 dual-beat output are retained from rev 7.
-// Diagnostic 7-bit timestamp (rev 8) retained in padding bits.
+// HP0 dual-beat workaround retained: each sample output TWICE on AXI-S.
+//
+// Rev 8: embed 7-bit timestamp (clk/2, ~50 MHz tick) in the 7 padding bits
+// of each 32-bit DMA word.  Expected inter-sample delta ≈ 104 ticks at
+// 480 kSPS.  Allows software to measure per-sample timing to diagnose
+// variable pair_ready rate at capture start.
 
-module waveform_capture #(
-    parameter SAMPLE_PERIOD = 208   // clocks per sample (100 MHz / 208 ≈ 480.769 kSPS)
-)(
+module waveform_capture (
     input  wire        clk,
     input  wire        rst_n,
 
@@ -28,10 +28,10 @@ module waveform_capture #(
     // Pulse output state (embedded in capture data for diagnostics)
     input  wire        pulse_state,
 
-    // Decoded XADC pair from xadc_drp_reader (used for data, not timing)
+    // Decoded XADC pair from xadc_drp_reader
     input  wire [11:0] ch1_data,
     input  wire [11:0] ch2_data,
-    input  wire        pair_ready,       // unused for capture timing in rev 9
+    input  wire        pair_ready,
 
     // Capture depth in pairs
     input  wire [15:0] capture_len,
@@ -47,24 +47,6 @@ module waveform_capture #(
 );
 
 wire trig_rise = trigger;
-
-// ── Fixed-rate sample tick generator ─────────────────
-// Fires every SAMPLE_PERIOD clocks while capturing is active.
-// Replaces pair_ready for FIFO writes, giving perfectly uniform timing.
-reg [15:0] tick_counter;
-wire       sample_tick = capturing & (tick_counter >= SAMPLE_PERIOD - 1);
-
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        tick_counter <= 16'd0;
-    end else if (!capturing) begin
-        tick_counter <= 16'd0;
-    end else if (tick_counter >= SAMPLE_PERIOD - 1) begin
-        tick_counter <= 16'd0;
-    end else begin
-        tick_counter <= tick_counter + 16'd1;
-    end
-end
 
 // ── Prescaled timestamp counter (clk/2 ≈ 50 MHz) ────
 reg [7:0] ts_prescale;
@@ -93,7 +75,7 @@ wire fifo_empty = (fifo_wr_ptr == fifo_rd_ptr);
 wire fifo_full  = (fifo_wr_ptr[FIFO_AW] != fifo_rd_ptr[FIFO_AW]) &&
                   (fifo_wr_ptr[FIFO_AW-1:0] == fifo_rd_ptr[FIFO_AW-1:0]);
 
-wire fifo_wr_en = sample_tick & ~fifo_full;
+wire fifo_wr_en = pair_ready & capturing & ~fifo_full;
 
 always @(posedge clk) begin
     if (fifo_wr_en)
@@ -133,13 +115,11 @@ always @(posedge clk or negedge rst_n) begin
         fifo_rd_ptr    <= 0;
     end else begin
 
-        // Count samples entering FIFO
         if (fifo_wr_en) begin
             fifo_wr_ptr <= fifo_wr_ptr + 1;
             samples_in  <= samples_in + 16'd1;
         end
 
-        // Stop accepting once we have enough
         if (capturing && samples_in >= cap_len_lat)
             capturing <= 1'b0;
 

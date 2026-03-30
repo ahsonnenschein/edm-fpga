@@ -196,57 +196,10 @@ class EdmServer:
         self._clients = []
         self._running = True
 
-        # ── Safe overlay load ─────────────────────────────────
-        # The PL reprogramming destroys all AXI interconnects.  If any
-        # PS→PL AXI transaction is in flight (stale DMA, MMIO read),
-        # the bus error crashes the kernel.  Fix: disable the PS AXI
-        # master/slave ports via SLCR before loading, re-enable after.
-        import mmap, struct
-
-        def _slcr_write(mem, offset, value):
-            mem.seek(offset)
-            mem.write(struct.pack("<I", value & 0xFFFFFFFF))
-
-        def _slcr_read(mem, offset):
-            mem.seek(offset)
-            return struct.unpack("<I", mem.read(4))[0]
-
-        try:
-            fd = open("/dev/mem", "r+b")
-            slcr = mmap.mmap(fd.fileno(), 0x1000, offset=0xF8000000)
-
-            # Unlock SLCR
-            _slcr_write(slcr, 0x008, 0xDF0D)
-
-            # Disable FPGA-facing AXI ports to prevent in-flight transactions
-            # FPGA_RST_CTRL (0x240): assert FPGA resets
-            _slcr_write(slcr, 0x240, 0x0F)
-            time.sleep(0.01)
-
-            # Lock SLCR
-            _slcr_write(slcr, 0x004, 0x767B)
-            slcr.close()
-            fd.close()
-            print("PL AXI ports disabled for safe overlay load")
-        except Exception as e:
-            print(f"SLCR pre-reset failed (first boot?): {e}")
-
         print(f"Loading overlay: {OVERLAY_BIT}")
         ol = Overlay(OVERLAY_BIT)
         time.sleep(1)
         print("Overlay loaded.")
-
-        # Deassert FPGA resets
-        try:
-            fd = open("/dev/mem", "r+b")
-            slcr = mmap.mmap(fd.fileno(), 0x1000, offset=0xF8000000)
-            _slcr_write(slcr, 0x008, 0xDF0D)   # unlock
-            _slcr_write(slcr, 0x240, 0x00)      # deassert FPGA resets
-            _slcr_write(slcr, 0x004, 0x767B)   # lock
-            slcr.close()
-            fd.close()
-        except Exception:
-            pass
 
         # Force FCLK_CLK0 to 100 MHz — apply_bd_automation can override PLL
         # settings during the Vivado build, so the bitstream may boot with the
@@ -289,8 +242,8 @@ class EdmServer:
         self._buf_phys = self._buf.physical_address
         print(f"DMA buffer: phys=0x{self._buf_phys:08X}, {MAX_CAPTURE} words")
 
-        self._edm.write(REG_CAPTURE_LEN, 100)
-        print("Capture length set to 100 samples (100 µs at 1 MSPS)")
+        self._edm.write(REG_CAPTURE_LEN, 47)
+        print("Capture length set to 47 samples (~98 µs at 480 kSPS, < 1 pulse period)")
 
         # Reset DMA engine
         self._dma.write(DMA_S2MM_CONTROL, 0x0004)
