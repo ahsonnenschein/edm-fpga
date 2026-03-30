@@ -66,13 +66,13 @@ The PYNQ-Z2 labels Arduino digital pins as `AR0`–`AR13` (not `D0`–`D13`).
 
 > All digital I/O is 3.3 V.  Use level shifters if the GEDM pulseboard or HFET module require 5 V logic.  Never drive AR1 above 3.3 V.
 
-### Serial — Raspberry Pi header (3.3 V)
+### Serial — Pmod B header (3.3 V)
 
-| RPi header pin | Signal | Connect to |
-|----------------|--------|------------|
-| Pin 8 (GPIO14) | UART1 TX → | DPH8909 RX |
-| Pin 10 (GPIO15) | UART1 RX ← | DPH8909 TX |
-| Pin 6 (GND) | GND | DPH8909 GND |
+| Pmod B pin | Signal | Connect to |
+|------------|--------|------------|
+| Pin 1 (JB1_P, W14) | UART1 TX → | DPH8909 RX |
+| Pin 2 (JB1_N, Y14) | UART1 RX ← | DPH8909 TX |
+| Pin 5 or 11 (GND) | GND | DPH8909 GND |
 
 Use the **TTL version** of the DPH8909 — connects directly with no USB adapter.
 
@@ -279,17 +279,17 @@ python3 software/operator_console.py
 - **Parameters**: set Ton / Toff in µs, click **Apply** — sends values to FPGA and auto-sets `capture_len = Ton + Toff` (one complete pulse cycle per burst, max 1024).
 - **Pulse overlay**: shows the last N burst waveforms overlaid (CH1 arc current, CH2 gap voltage).  The **Show 1 in every N pulses** spinbox controls which pulses appear in the overlay (default: 1 in 1000).  Every pulse feeds the histogram regardless.
 - **Histogram**: rolling 1-minute distribution of per-pulse mean gap voltage and arc current.
-- **Gap Voltage (DPH8909)**: set voltage and current limit, toggle output on/off.  Commands route over TCP to the board; the board drives the PSU directly via `/dev/ttyPS1` (Raspberry Pi header UART).  Measured V/I readback updates at 1 Hz.
+- **Gap Voltage (DPH8909)**: set voltage and current limit, toggle output on/off.  Commands route over TCP to the board; the board drives the PSU directly via `/dev/ttyPS1` (Pmod B UART).  Measured V/I readback updates at 1 Hz.
 
 ### DPH8909 PSU wiring
 
-The DPH8909 **TTL version** connects directly to the PYNQ-Z2 Raspberry Pi header — no USB adapter needed.
+The DPH8909 **TTL version** connects directly to the PYNQ-Z2 Pmod B header — no USB adapter needed.
 
-| DPH8909 pin | PYNQ-Z2 RPi header |
-|-------------|-------------------|
-| GND | Pin 6 (GND) |
-| RX | Pin 8 (GPIO14 / UART TX — `/dev/ttyPS1`) |
-| TX | Pin 10 (GPIO15 / UART RX — `/dev/ttyPS1`) |
+| DPH8909 pin | PYNQ-Z2 Pmod B |
+|-------------|----------------|
+| GND | Pin 5 or 11 (GND) |
+| RX | Pin 1 (JB1_P / UART TX — `/dev/ttyPS1`) |
+| TX | Pin 2 (JB1_N / UART RX — `/dev/ttyPS1`) |
 
 The server uses the Juntek simple ASCII protocol at 9600 baud (device default).  Check menu items **6-bd** (baud) and **7-Ad** (address, must be `01`) on the PSU front panel if it does not respond.
 
@@ -439,3 +439,51 @@ Run via SSH (`sudo bash /tmp/restart_edm.sh`).  The SSH session drops, but the P
 ### 9. `XILINX_XRT=/usr` is required for PYNQ overlay loading
 
 Without `export XILINX_XRT=/usr`, the PYNQ overlay loader fails with cryptic errors.  This environment variable is set in the board's default login profile but is lost when running via `sudo` or `nohup` from a script.  Always export it explicitly in wrapper scripts.
+
+### 10. Vivado IP cache must be cleared when modifying block design RTL modules
+
+When RTL source files for a block design module reference (e.g. `edm_top`, `waveform_capture`) are modified, `reset_run synth_1` does NOT re-synthesize the module.  Vivado reuses the OOC synthesis result from its IP cache (`edm_pynq.cache/ip/`).  The only way to force re-synthesis is to **delete the IP cache** before rebuilding.
+
+### 11. Never set XADC calibration parameters in simultaneous sampling mode
+
+Setting `CONFIG.ADC_OFFSET_AND_GAIN_CALIBRATION` or `CONFIG.SENSOR_OFFSET_AND_GAIN_CALIBRATION` on the XADC Wizard in simultaneous sampling mode produces warnings ("disabled parameter … ignored"), but **silently corrupts** the generated IP.  The resulting XADC produces no valid data — temperature reads −270 °C, all channel values are zero, and `pair_ready` never fires.
+
+### 12. XADC actual sample rate is 480 kSPS, not 500 kSPS
+
+With DCLK=100 MHz, divider=4, and 2 channels (VP/VN + VAUX6) sequenced through DRP:
+```
+pair_rate = 100 MHz / (4 × 26 cycles × 2 channels) = 480.769 kSPS
+```
+The display time axis must use 480769, not 500000, for accurate pulse timing.  Additionally, XADC automatic calibration inserts extra conversion cycles approximately every 34 samples, creating periodic timing gaps in the `pair_ready` stream.
+
+### 13. Overlay load can crash the board — assert FPGA resets via SLCR first
+
+Loading a PYNQ overlay reprograms the PL, destroying all AXI interconnects.  If any PS→PL AXI transaction is in flight (stale DMA, cached MMIO), the bus error crashes the kernel.  Simply resetting the DMA is not enough — any cached or pending AXI transaction can cause a fault.
+
+**Fix:** Assert all FPGA resets via the Zynq SLCR register `FPGA_RST_CTRL` (`0xF8000240`) before loading the overlay.  This safely quiesces all PL-side logic:
+```python
+import mmap, struct
+fd = open("/dev/mem", "r+b")
+slcr = mmap.mmap(fd.fileno(), 0x1000, offset=0xF8000000)
+slcr.seek(0x008); slcr.write(struct.pack("<I", 0xDF0D))     # unlock SLCR
+slcr.seek(0x240); slcr.write(struct.pack("<I", 0x0F))       # assert FPGA resets
+slcr.seek(0x004); slcr.write(struct.pack("<I", 0x767B))     # lock SLCR
+slcr.close(); fd.close()
+time.sleep(0.01)
+
+ol = Overlay(OVERLAY_BIT)   # safe — no in-flight AXI transactions
+
+# Deassert FPGA resets after load (same SLCR unlock/write 0x00/lock sequence)
+```
+This makes overlay loading reliable over SSH — no more crashes or power cycles needed.
+
+### 14. PS UART1 via device tree overlay is unreliable — use MMIO instead
+
+The Linux device tree overlay for PS UART1 (`/dev/ttyPS1`) fails with `uart_add_one_port() err=-22` because the PYNQ base device tree has an incomplete UART1 node (missing `reg` property).  Rather than fixing the DT, access the UART1 registers directly via MMIO at `0xE0001000`.  Enable clocks first through the SLCR (unlock `0xDF0D`, set UART1 ref clock bit in `0x154`, AMBA clock bit 21 in `0x12C`, clear reset bits in `0x228`).
+
+### 15. DPH8909 PSU: use `w20` combined command for voltage + current
+
+Sending separate `w10` (voltage) and `w11` (current) commands back-to-back at 9600 baud causes the second command to be dropped — the PSU is still processing the first when the second arrives.  Use the combined `w20` command which sets both in a single frame:
+```
+:01w20=5000,1500,\r\n    → 50.00 V, 1.500 A
+```

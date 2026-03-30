@@ -2,10 +2,11 @@
 """
 modbus_server.py
 Modbus TCP server for EDM FPGA controller (PYNQ-Z2 PS side).
+Compatible with pymodbus 3.x.
 
 Intended for LinuxCNC HAL integration via mb2hal or Classic Ladder.
 
-Modbus holding registers (16-bit, read/write):
+Modbus holding registers (16-bit, read/write, FC3/FC16):
   0: Ton_us           Ton duration in microseconds          (default 10)
   1: Toff_us          Toff duration in microseconds         (default 90)
   2: Enable           0=stop, 1=run                         (default 0)
@@ -13,7 +14,7 @@ Modbus holding registers (16-bit, read/write):
   4: Short_threshold  Gap voltage below this = short        (default 200)
   5: Open_threshold   Gap voltage above this = open gap     (default 3500)
 
-Modbus input registers (16-bit, read-only):
+Modbus input registers (16-bit, read-only, FC4):
   0: Pulse_count_lo   Lower 16 bits of running pulse count
   1: Pulse_count_hi   Upper 16 bits of running pulse count
   2: HV_enable        Operator HV enable switch state (0 or 1)
@@ -25,18 +26,12 @@ Run as root on the board:
 """
 
 import mmap, struct, logging, threading, time
-from pymodbus.server import StartTcpServer
-from pymodbus.datastore import (
-    ModbusSlaveContext, ModbusServerContext, ModbusSequentialDataBlock
-)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 EDM_BASE   = 0x43C00000
 EDM_SIZE   = 0x1000
-XADC_BASE  = 0x43C20000
-XADC_SIZE  = 0x400
 CLK_MHZ    = 100
 
 # EDM AXI register offsets
@@ -45,28 +40,26 @@ REG_TOFF_CYCLES = 0x04
 REG_ENABLE      = 0x08
 REG_PULSE_COUNT = 0x0C
 REG_HV_ENABLE   = 0x10
+REG_XADC_CH1    = 0x1C
 
-# XADC register offsets
-XADC_VP_VN = 0x240   # CH1: gap voltage
-
-# Smoothing factor for gap voltage IIR filter (0 < alpha < 1)
-# Lower = smoother but slower response
-ALPHA = 0.05
-
-# How often to update the gap voltage average (seconds)
+# Smoothing
+ALPHA        = 0.05
 XADC_POLL_HZ = 500
 
 
-class EdmAxiRegs:
-    """Read/write EDM AXI-Lite registers via /dev/mem."""
+class EdmHardware:
+    """Direct /dev/mem access to EDM AXI registers."""
 
     def __init__(self):
-        self._fd   = open("/dev/mem", "r+b")
-        self._mem  = mmap.mmap(self._fd.fileno(), EDM_SIZE,
-                               offset=EDM_BASE, access=mmap.ACCESS_WRITE)
-        self._xfd  = open("/dev/mem", "rb")
-        self._xmem = mmap.mmap(self._xfd.fileno(), XADC_SIZE,
-                               offset=XADC_BASE, access=mmap.ACCESS_READ)
+        self._fd  = open("/dev/mem", "r+b")
+        self._mem = mmap.mmap(self._fd.fileno(), EDM_SIZE,
+                              offset=EDM_BASE, access=mmap.ACCESS_WRITE)
+        self._gap_avg = 0.0
+        self._gap_lock = threading.Lock()
+
+        # Start gap voltage polling thread
+        t = threading.Thread(target=self._poll_gap, daemon=True)
+        t.start()
 
     def write(self, offset, value):
         self._mem.seek(offset)
@@ -76,113 +69,106 @@ class EdmAxiRegs:
         self._mem.seek(offset)
         return struct.unpack("<I", self._mem.read(4))[0]
 
-    def read_xadc(self, offset):
-        self._xmem.seek(offset)
-        return struct.unpack("<I", self._xmem.read(4))[0]
-
-
-class GapVoltageFilter:
-    """
-    Polls XADC CH1 at high rate and maintains an IIR-smoothed gap voltage.
-    Runs in a background thread so Modbus reads always get a fresh average.
-    """
-
-    def __init__(self, regs: EdmAxiRegs):
-        self._regs   = regs
-        self._avg    = 0.0
-        self._lock   = threading.Lock()
-        t = threading.Thread(target=self._loop, daemon=True)
-        t.start()
-
-    def _loop(self):
+    def _poll_gap(self):
         interval = 1.0 / XADC_POLL_HZ
         while True:
             t0 = time.monotonic()
             try:
-                raw = self._regs.read_xadc(XADC_VP_VN) >> 4  # 12-bit
-                with self._lock:
-                    self._avg += ALPHA * (raw - self._avg)
-            except Exception as e:
-                log.warning(f"XADC read error: {e}")
+                raw = self.read(REG_XADC_CH1) & 0xFFF
+                with self._gap_lock:
+                    self._gap_avg += ALPHA * (raw - self._gap_avg)
+            except Exception:
+                pass
             elapsed = time.monotonic() - t0
             time.sleep(max(0, interval - elapsed))
 
-    def get(self) -> int:
-        with self._lock:
-            return int(round(self._avg))
+    @property
+    def gap_voltage_avg(self):
+        with self._gap_lock:
+            return int(round(self._gap_avg))
 
 
-class EdmHoldingBlock(ModbusSequentialDataBlock):
-    """Holding registers — writes go straight to FPGA."""
-
-    def __init__(self, regs: EdmAxiRegs):
-        #              Ton  Toff  En  Setpt  Short  Open
-        defaults = [   10,   90,  0,  2048,   200,  3500]
-        super().__init__(0, defaults)
-        self._regs = regs
-        for i, v in enumerate(defaults):
-            self._write_hw(i, v)
-
-    def setValues(self, address, values):
-        super().setValues(address, values)
-        for i, val in enumerate(values):
-            self._write_hw(address - 1 + i, val)
-
-    def _write_hw(self, reg, val):
-        try:
-            if reg == 0:
-                self._regs.write(REG_TON_CYCLES,  max(1, int(val)) * CLK_MHZ)
-            elif reg == 1:
-                self._regs.write(REG_TOFF_CYCLES, max(1, int(val)) * CLK_MHZ)
-            elif reg == 2:
-                self._regs.write(REG_ENABLE, 1 if val else 0)
-            # regs 3-5 are thresholds used by EdmInputBlock — no FPGA write needed
-        except Exception as e:
-            log.error(f"AXI write error reg {reg}: {e}")
+# Holding register defaults and thresholds (stored in Python, not on FPGA)
+hr_values = {
+    0: 10,     # Ton_us
+    1: 90,     # Toff_us
+    2: 0,      # Enable
+    3: 2048,   # Gap_setpoint
+    4: 200,    # Short_threshold
+    5: 3500,   # Open_threshold
+}
 
 
-class EdmInputBlock(ModbusSequentialDataBlock):
-    """Input registers — refreshed from hardware on each Modbus read."""
-
-    def __init__(self, regs: EdmAxiRegs, holding: EdmHoldingBlock,
-                 gap_filter: GapVoltageFilter):
-        super().__init__(0, [0, 0, 0, 0, 0])
-        self._regs       = regs
-        self._holding    = holding
-        self._gap_filter = gap_filter
-
-    def getValues(self, address, count=1):
-        try:
-            pc      = self._regs.read(REG_PULSE_COUNT)
-            hv      = self._regs.read(REG_HV_ENABLE) & 1
-            gap_avg = self._gap_filter.get()
-
-            # Read thresholds from holding registers (1-based in pymodbus)
-            short_thresh = self._holding.getValues(5, 1)[0]
-            open_thresh  = self._holding.getValues(6, 1)[0]
-            arc_ok = 1 if (short_thresh < gap_avg < open_thresh) else 0
-
-            self.values = [
-                pc & 0xFFFF,
-                (pc >> 16) & 0xFFFF,
-                hv,
-                gap_avg,
-                arc_ok,
-            ]
-        except Exception as e:
-            log.error(f"Status read error: {e}")
-        return super().getValues(address, count)
+def write_hr_to_hw(hw, reg, val):
+    """Push a holding register value to the FPGA."""
+    if reg == 0:
+        hw.write(REG_TON_CYCLES, max(1, int(val)) * CLK_MHZ)
+    elif reg == 1:
+        hw.write(REG_TOFF_CYCLES, max(1, int(val)) * CLK_MHZ)
+    elif reg == 2:
+        hw.write(REG_ENABLE, 1 if val else 0)
+    # regs 3-5 are software-only thresholds
 
 
 def main():
-    log.info(f"Connecting to EDM AXI registers at 0x{EDM_BASE:08X}")
-    regs       = EdmAxiRegs()
-    gap_filter = GapVoltageFilter(regs)
-    holding    = EdmHoldingBlock(regs)
-    inputs     = EdmInputBlock(regs, holding, gap_filter)
+    from pymodbus.server import StartTcpServer
+    from pymodbus.datastore import (
+        ModbusServerContext, ModbusSequentialDataBlock,
+    )
+    from pymodbus.datastore.context import ModbusBaseDeviceContext
 
-    store   = ModbusSlaveContext(hr=holding, ir=inputs)
-    context = ModbusServerContext(slaves=store, single=True)
+    log.info(f"Connecting to EDM AXI registers at 0x{EDM_BASE:08X}")
+    hw = EdmHardware()
+
+    # Write defaults to hardware
+    for reg, val in hr_values.items():
+        write_hr_to_hw(hw, reg, val)
+
+    # Create data blocks with pymodbus 3.x API
+    # Address 0 in the block = Modbus address 0
+    hr_block = ModbusSequentialDataBlock(0, list(hr_values.values()))
+    ir_block = ModbusSequentialDataBlock(0, [0] * 5)
+
+    # Custom slave context that intercepts reads/writes
+    class EdmContext(ModbusBaseDeviceContext):
+        def __init__(self):
+            super().__init__()
+            self.store = {'h': hr_block, 'i': ir_block,
+                          'd': ModbusSequentialDataBlock(0, [0]),
+                          'c': ModbusSequentialDataBlock(0, [0])}
+
+        def validate(self, fc, address, count=1):
+            if fc in (3, 6, 16):  # holding registers
+                return 0 <= address < 6 and address + count <= 6
+            if fc == 4:           # input registers
+                return 0 <= address < 5 and address + count <= 5
+            return False
+
+        def getValues(self, fc, address, count=1):
+            if fc == 4:  # input registers
+                pc = hw.read(REG_PULSE_COUNT)
+                hv = hw.read(REG_HV_ENABLE) & 1
+                gap = hw.gap_voltage_avg
+                short_t = hr_values.get(4, 200)
+                open_t = hr_values.get(5, 3500)
+                arc_ok = 1 if (short_t < gap < open_t) else 0
+                ir_data = [pc & 0xFFFF, (pc >> 16) & 0xFFFF, hv, gap, arc_ok]
+                return ir_data[address:address + count]
+            if fc in (3,):  # holding registers
+                vals = list(hr_values.values())
+                return vals[address:address + count]
+            return [0] * count
+
+        def setValues(self, fc, address, values):
+            if fc in (6, 16):  # write holding registers
+                for i, val in enumerate(values):
+                    reg = address + i
+                    if reg in hr_values:
+                        hr_values[reg] = val
+                        write_hr_to_hw(hw, reg, val)
+
+    store = EdmContext()
+    context = ModbusServerContext(devices=store, single=True)
 
     log.info("Starting Modbus TCP server on port 502")
     log.info("Holding: 0=Ton_us  1=Toff_us  2=Enable  3=Gap_setpoint  "

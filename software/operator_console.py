@@ -791,8 +791,7 @@ class OperatorConsole(QMainWindow):
     def _psu_set(self):
         v = self._psu_v_spin.value()
         i = self._psu_i_spin.value()
-        self._worker.send_cmd({'cmd': 'set_psu_voltage', 'value': v})
-        self._worker.send_cmd({'cmd': 'set_psu_current', 'value': i})
+        self._worker.send_cmd({'cmd': 'set_psu_vi', 'voltage': v, 'current': i})
         self.statusBar().showMessage(f"PSU set: {v:.1f} V  {i:.2f} A")
 
     def _psu_output(self, checked: bool):

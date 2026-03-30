@@ -75,31 +75,89 @@ class DPH8909:
       w12  output on/off       1=on 0=off
       r30  read VOUT ×100
       r31  read IOUT ×1000
+
+    Uses direct MMIO access to PS UART1 registers (0xE0001000) instead of
+    /dev/ttyPS1, which requires a device-tree overlay that fails on PYNQ.
+    UART1 clocks are enabled via SLCR on init.
     """
-    def __init__(self, port: str, address: int = 1, baudrate: int = 9600):
-        import serial
-        self._ser  = serial.Serial(port, baudrate=baudrate,
-                                   bytesize=8, parity='N', stopbits=1, timeout=0.5)
+    # Zynq UART register offsets
+    _CR      = 0x00
+    _MR      = 0x04
+    _SR      = 0x2C
+    _FIFO    = 0x30
+    _BAUDGEN = 0x18
+    _BAUDDIV = 0x34
+    _RXTOUT  = 0x1C
+
+    def __init__(self, port: str = None, address: int = 1, baudrate: int = 9600):
+        from pynq import MMIO
         self._addr = address
         self._lock = threading.Lock()
 
+        # Enable UART1 clocks via SLCR
+        slcr = MMIO(0xF8000000, 0x1000)
+        slcr.write(0x008, 0xDF0D)                           # unlock SLCR
+        slcr.write(0x154, slcr.read(0x154) | 0x02)          # UART1 ref clock
+        slcr.write(0x12C, slcr.read(0x12C) | (1 << 21))     # UART1 AMBA clock
+        slcr.write(0x228, slcr.read(0x228) & ~0x0C)         # deassert UART1 reset
+        slcr.write(0x004, 0x767B)                            # lock SLCR
+        time.sleep(0.01)
+
+        # Configure UART1: 9600 baud, 8N1
+        self._uart = MMIO(0xE0001000, 0x1000)
+        self._uart.write(self._CR, 0x28)       # TX_DIS + RX_DIS
+        time.sleep(0.001)
+        self._uart.write(self._CR, 0x03)       # reset TX + RX FIFOs
+        time.sleep(0.001)
+        self._uart.write(self._MR, 0x20)       # 8 data, 1 stop, no parity
+        # 9600 baud: 100 MHz / (651 * 16) ≈ 9600
+        self._uart.write(self._BAUDGEN, 651)
+        self._uart.write(self._BAUDDIV, 15)
+        self._uart.write(self._RXTOUT, 10)
+        self._uart.write(self._CR, 0x14)       # TX_EN + RX_EN
+        time.sleep(0.05)
+
     def close(self):
-        try: self._ser.close()
-        except Exception: pass
+        pass
+
+    def _flush_rx(self):
+        """Drain any stale bytes from the RX FIFO."""
+        for _ in range(64):
+            if self._uart.read(self._SR) & 0x02:  # RX empty
+                break
+            self._uart.read(self._FIFO)
+
+    def _write_bytes(self, data: bytes):
+        for b in data:
+            while self._uart.read(self._SR) & 0x10:  # TX full
+                pass
+            self._uart.write(self._FIFO, b)
+
+    def _read_line(self, timeout: float = 0.5) -> str:
+        buf = bytearray()
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if self._uart.read(self._SR) & 0x02:  # RX empty
+                time.sleep(0.001)
+                continue
+            ch = self._uart.read(self._FIFO) & 0xFF
+            buf.append(ch)
+            if ch == 0x0A:  # newline
+                break
+        return buf.decode(errors='replace').strip()
 
     def _send(self, func: str, cmd: int, value: int):
         frame = f":{self._addr:02d}{func}{cmd:02d}={value},\r\n".encode()
         with self._lock:
-            self._ser.reset_input_buffer()
-            self._ser.write(frame)
+            self._flush_rx()
+            self._write_bytes(frame)
 
     def _query(self, cmd: int) -> int:
         frame = f":{self._addr:02d}r{cmd:02d}=0,\r\n".encode()
         with self._lock:
-            self._ser.reset_input_buffer()
-            self._ser.write(frame)
-            resp = self._ser.readline()
-        resp = resp.decode(errors='replace').strip()
+            self._flush_rx()
+            self._write_bytes(frame)
+            resp = self._read_line()
         if not resp:
             raise IOError("No response")
         sep = max(resp.rfind('='), resp.rfind(':'))
@@ -110,6 +168,16 @@ class DPH8909:
 
     def set_current(self, amps: float):
         self._send('w', 11, round(amps * 1000))
+
+    def set_voltage_current(self, volts: float, amps: float):
+        """Set both voltage and current in a single command (w20).
+        Avoids timing issues when sending w10 + w11 back-to-back at 9600 baud."""
+        v = round(volts * 100)
+        i = round(amps * 1000)
+        frame = f":{self._addr:02d}w20={v},{i},\r\n".encode()
+        with self._lock:
+            self._flush_rx()
+            self._write_bytes(frame)
 
     def set_output(self, on: bool):
         self._send('w', 12, 1 if on else 0)
@@ -128,10 +196,57 @@ class EdmServer:
         self._clients = []
         self._running = True
 
+        # ── Safe overlay load ─────────────────────────────────
+        # The PL reprogramming destroys all AXI interconnects.  If any
+        # PS→PL AXI transaction is in flight (stale DMA, MMIO read),
+        # the bus error crashes the kernel.  Fix: disable the PS AXI
+        # master/slave ports via SLCR before loading, re-enable after.
+        import mmap, struct
+
+        def _slcr_write(mem, offset, value):
+            mem.seek(offset)
+            mem.write(struct.pack("<I", value & 0xFFFFFFFF))
+
+        def _slcr_read(mem, offset):
+            mem.seek(offset)
+            return struct.unpack("<I", mem.read(4))[0]
+
+        try:
+            fd = open("/dev/mem", "r+b")
+            slcr = mmap.mmap(fd.fileno(), 0x1000, offset=0xF8000000)
+
+            # Unlock SLCR
+            _slcr_write(slcr, 0x008, 0xDF0D)
+
+            # Disable FPGA-facing AXI ports to prevent in-flight transactions
+            # FPGA_RST_CTRL (0x240): assert FPGA resets
+            _slcr_write(slcr, 0x240, 0x0F)
+            time.sleep(0.01)
+
+            # Lock SLCR
+            _slcr_write(slcr, 0x004, 0x767B)
+            slcr.close()
+            fd.close()
+            print("PL AXI ports disabled for safe overlay load")
+        except Exception as e:
+            print(f"SLCR pre-reset failed (first boot?): {e}")
+
         print(f"Loading overlay: {OVERLAY_BIT}")
         ol = Overlay(OVERLAY_BIT)
         time.sleep(1)
         print("Overlay loaded.")
+
+        # Deassert FPGA resets
+        try:
+            fd = open("/dev/mem", "r+b")
+            slcr = mmap.mmap(fd.fileno(), 0x1000, offset=0xF8000000)
+            _slcr_write(slcr, 0x008, 0xDF0D)   # unlock
+            _slcr_write(slcr, 0x240, 0x00)      # deassert FPGA resets
+            _slcr_write(slcr, 0x004, 0x767B)   # lock
+            slcr.close()
+            fd.close()
+        except Exception:
+            pass
 
         # Force FCLK_CLK0 to 100 MHz — apply_bd_automation can override PLL
         # settings during the Vivado build, so the bitstream may boot with the
@@ -182,16 +297,16 @@ class EdmServer:
         time.sleep(0.01)
         self._dma.write(DMA_S2MM_CONTROL, 0x0001)   # RS=1 (run)
 
-        # PSU on Raspberry Pi header UART (/dev/ttyPS1)
+        # PSU on Pmod B UART (MMIO access to PS UART1, no /dev/ttyPS1 needed)
         self._psu      = None
         self._psu_vout = None
         self._psu_iout = None
         self._psu_status_iter = 0
         try:
-            self._psu = DPH8909(PSU_PORT, baudrate=PSU_BAUD)
-            print(f"PSU connected: {PSU_PORT} @ {PSU_BAUD} baud")
+            self._psu = DPH8909(baudrate=PSU_BAUD)
+            print(f"PSU connected via MMIO UART1 @ {PSU_BAUD} baud")
         except Exception as e:
-            print(f"PSU not available ({PSU_PORT}): {e}")
+            print(f"PSU not available: {e}")
 
     # ── XADC register access ──────────────────────────────────────────────────
 
@@ -270,9 +385,19 @@ class EdmServer:
         Arms the AXI DMA S2MM channel via MMIO, waits for each waveform burst
         (TLAST from waveform_capture), then broadcasts the burst frame.
 
-        Completion detection: poll for IOC_Irq (bit 12) or Idle=1 after the
-        DMA has had time to start.  The old two-phase approach missed fast
-        completions (<100 µs) because the 100 µs sleep skipped over Idle=0.
+        DMA is armed at the top of each iteration and NOT re-armed until
+        the buffer has been fully read and processed.  This prevents the
+        buffer from being overwritten by a subsequent capture before the
+        software reads it — the root cause of the "first period anomaly"
+        where the first inter-pulse period varied randomly from 35-78
+        samples while subsequent periods were rock-steady at 48.
+
+        NOTE: XADC automatic calibration inserts extra conversion cycles
+        approximately every 34 samples, creating a ~2 µs timing gap in the
+        pair_ready stream.  This is visible in the timestamp deltas as an
+        anomalous value at sample ~34.  It does NOT affect sample values —
+        only the inter-sample timing.  Disabling calibration would degrade
+        ADC accuracy and is not recommended.
         """
         last_wf_count = self._edm.read(REG_WAVEFORM_CNT)
         _last_tx   = 0.0
@@ -280,7 +405,6 @@ class EdmServer:
         _dbg_p1_to = 0   # phase-1 timeouts (DMA never went non-idle)
         _dbg_p2_to = 0   # phase-2 timeouts (TLAST never arrived)
         _dbg_ok    = 0   # successful captures
-        _skip_arm  = False   # True when DMA was already re-armed mid-loop
 
         while self._running:
             try:
@@ -289,31 +413,27 @@ class EdmServer:
                 ))
                 _dbg_iter += 1
 
-                if not _skip_arm:
-                    # If DMA is halted (error or reset needed), recover before arming.
-                    st_before = self._dma.read(DMA_S2MM_STATUS)
-                    if st_before & self._DMA_HALTED:
-                        self._dma.write(DMA_S2MM_CONTROL, 0x0004)   # reset
-                        time.sleep(0.002)
-                        self._dma.write(DMA_S2MM_CONTROL, 0x0001)   # RS=1
-                        time.sleep(0.001)
-                    # Clear sticky status bits (IOC_Irq, Err_Irq) by W1C before arming.
-                    self._dma.write(DMA_S2MM_STATUS, 0x7000)
+                # ── Arm DMA (every iteration — no skip_arm optimization) ──
+                st_before = self._dma.read(DMA_S2MM_STATUS)
+                if st_before & self._DMA_HALTED:
+                    self._dma.write(DMA_S2MM_CONTROL, 0x0004)   # reset
+                    time.sleep(0.002)
+                    self._dma.write(DMA_S2MM_CONTROL, 0x0001)   # RS=1
+                    time.sleep(0.001)
+                # Clear sticky status bits (IOC_Irq, Err_Irq) by W1C before arming.
+                self._dma.write(DMA_S2MM_STATUS, 0x7000)
 
-                    # Arm: destination address then length (length write starts transfer)
-                    self._dma.write(DMA_S2MM_DST_ADDR, self._buf_phys & 0xFFFFFFFF)
-                    self._dma.write(DMA_S2MM_LENGTH,   capture_len * 8)  # ×8: HP0 writes at 64-bit stride
-                    st_after  = self._dma.read(DMA_S2MM_STATUS)
+                # Arm: destination address then length (length write starts transfer)
+                self._dma.write(DMA_S2MM_DST_ADDR, self._buf_phys & 0xFFFFFFFF)
+                self._dma.write(DMA_S2MM_LENGTH,   capture_len * 8)  # ×8: HP0 64-bit stride
+                st_after  = self._dma.read(DMA_S2MM_STATUS)
 
-                    if _dbg_iter <= 5 or _dbg_iter % 200 == 0:
-                        print(f"DMA arm #{_dbg_iter}: status before=0x{st_before:04X} "
-                              f"after=0x{st_after:04X} cap={capture_len} "
-                              f"p1_to={_dbg_p1_to} p2_to={_dbg_p2_to} ok={_dbg_ok}")
-                _skip_arm = False
+                if _dbg_iter <= 5 or _dbg_iter % 200 == 0:
+                    print(f"DMA arm #{_dbg_iter}: status before=0x{st_before:04X} "
+                          f"after=0x{st_after:04X} cap={capture_len} "
+                          f"p1_to={_dbg_p1_to} p2_to={_dbg_p2_to} ok={_dbg_ok}")
 
                 # Phase 1: wait for DMA to go non-idle (Idle=0), max 200 ms.
-                # A very fast capture (<100 µs) may complete before our first
-                # poll — if we already see IOC_Irq set, skip straight to phase 2.
                 t0 = time.time()
                 phase1_ok = False
                 while time.time() - t0 < 0.2:
@@ -344,7 +464,6 @@ class EdmServer:
                     if st & (self._DMA_IDLE | self._DMA_IOC_IRQ):
                         phase2_ok = True
                         break
-                    # Abort on DMA errors
                     if st & (self._DMA_DMAERR | self._DMA_SLVERR | self._DMA_DECERR):
                         print(f"DMA error flags: status=0x{st:04X}")
                         break
@@ -363,13 +482,22 @@ class EdmServer:
 
                 wf_count = self._edm.read(REG_WAVEFORM_CNT)
                 if wf_count == last_wf_count:
-                    time.sleep(0.0005)   # brief yield — avoid busy-spin between pulses
+                    time.sleep(0.0005)
                     continue
+
+                skipped = wf_count - last_wf_count - 1
+                if skipped > 0 and _dbg_ok <= 20:
+                    print(f"DMA: skipped {skipped} captures (normal with rate-limiting)")
                 _dbg_ok += 1
                 last_wf_count = wf_count
 
-                # Read buffer immediately while DMA is idle (before re-arming).
-                # Parse buffer: {ch1[11:0], 4'b0, ch2[11:0], 3'b0, pulse_state}
+                # Read buffer while DMA is idle (NOT re-armed — buffer is stable).
+                # Parse buffer: {ch1[11:0], ts[6:3], ch2[11:0], ts[2:0], pulse_state}
+                #   bits [31:20] = ch1[11:0]
+                #   bits [19:16] = ts[6:3]   (diagnostic timestamp, 50 MHz tick)
+                #   bits [15:4]  = ch2[11:0]
+                #   bits [3:1]   = ts[2:0]
+                #   bit  [0]     = pulse_state
                 #
                 # HP0 port quirk: despite 32-bit configuration, the Zynq HP port
                 # writes each 32-bit DMA word at 8-byte (64-bit) stride.  Valid
@@ -380,18 +508,13 @@ class EdmServer:
                 ch1_raw = ((words[:n_pairs] >> 20) & 0xFFF).astype(np.float32)
                 ch2_raw = ((words[:n_pairs] >> 4)  & 0xFFF).astype(np.float32)
                 pulse_bits = (words[:n_pairs] & 0x1).astype(np.int32)
+                ts_bits = ((((words[:n_pairs] >> 16) & 0xF) << 3) |
+                           ((words[:n_pairs] >> 1) & 0x7)).astype(np.int32)
                 ch1_v   = (ch1_raw / 4096.0 * CH1_DIVIDER * CH1_PROBE).tolist()
                 ch2_v   = (ch2_raw / 4096.0 * CH2_RANGE).tolist()
 
-                # Re-arm DMA immediately after reading so next pulse is captured
-                # even if broadcast (TCP sendall) blocks for several milliseconds.
-                self._dma.write(DMA_S2MM_STATUS, 0x7000)
-                self._dma.write(DMA_S2MM_DST_ADDR, self._buf_phys & 0xFFFFFFFF)
-                self._dma.write(DMA_S2MM_LENGTH,   capture_len * 8)  # ×8: HP0 writes at 64-bit stride
-                _skip_arm = True   # skip redundant re-arm at top of next iteration
-
                 # Rate-limit broadcasts: max 100 bursts/s to the console.
-                # DMA is already running; safe to skip a TX without missing captures.
+                # DMA is NOT re-armed here — next iteration arms fresh.
                 now = time.time()
                 if now - _last_tx < 0.01:
                     continue
@@ -403,12 +526,12 @@ class EdmServer:
                     'ch1':            [round(v, 4) for v in ch1_v],
                     'ch2':            [round(v, 4) for v in ch2_v],
                     'pulse':          pulse_bits.tolist(),
+                    'ts':             ts_bits.tolist(),
                 }).encode() + b'\n'
 
                 self._broadcast(frame)
 
             except Exception as e:
-                _skip_arm = False
                 print(f"DMA error: {e}")
                 time.sleep(0.1)
 
@@ -452,6 +575,11 @@ class EdmServer:
         elif c == 'set_psu_current':
             if self._psu:
                 self._psu.set_current(float(v))
+        elif c == 'set_psu_vi':
+            if self._psu:
+                self._psu.set_voltage_current(
+                    float(cmd.get('voltage', 0)),
+                    float(cmd.get('current', 0)))
         elif c == 'set_psu_output':
             if self._psu:
                 self._psu.set_output(bool(v))
