@@ -11,8 +11,8 @@ Two independent data streams over TCP (port 5006):
   Burst frames  (one per pulse, JSON):
     {"type":"burst", "waveform_count":…,
      "ch1":[…], "ch2":[…]}
-    ch1/ch2 are lists of voltages at 500 kSPS per channel.
-    Length = capture_len // 2 (capture_len raw DMA words, half are valid pairs).
+    ch1/ch2 are lists of voltages at 1 MSPS per channel.
+    Length = capture_len (one valid pair per DMA word).
 
 Run from the board's LOCAL terminal (NOT via SSH — overlay load crashes SSH sessions):
     sudo env XILINX_XRT=/usr /usr/local/share/pynq-venv/bin/python3 /home/xilinx/xadc_server.py &
@@ -57,9 +57,9 @@ REG_XADC_CH2      = 0x20   # latest CH2 12-bit raw
 REG_XADC_TEMP     = 0x24   # latest temperature 12-bit raw
 
 # ADC scaling
-CH1_DIVIDER = 3.0    # ÷3 resistor divider on VP/VN probe input
-CH1_PROBE   = 1.0    # probe attenuation ratio — calibrate once wired
-CH2_RANGE   = 3.3    # GEDM output 0–3.3 V
+CH1_DIVIDER = 1.0    # no resistor divider on VP/VN — probe output feeds directly
+CH1_PROBE   = 50.0   # Hantek 50x probe attenuation
+CH2_RANGE   = 4.95   # GEDM output via J1 A0 ÷5 on-board divider (calibrated: 3.3V in → 2.2V displayed at 3.3, so ×1.5)
 
 # Maximum samples per burst buffer (4 KB = 1024 × 32-bit words)
 MAX_CAPTURE = 1024
@@ -158,7 +158,7 @@ class EdmServer:
         self._edm = MMIO(EDM_BASE, 0x28)
         self._dma = MMIO(DMA_BASE, 0x100)
 
-        self._buf = allocate(shape=(MAX_CAPTURE,), dtype=np.uint32)
+        self._buf = allocate(shape=(MAX_CAPTURE * 2,), dtype=np.uint32)  # ×2: HP0 64-bit stride
         self._buf_phys = self._buf.physical_address
         print(f"DMA buffer: phys=0x{self._buf_phys:08X}, {MAX_CAPTURE} words")
 
@@ -268,6 +268,7 @@ class EdmServer:
         _dbg_p1_to = 0   # phase-1 timeouts (DMA never went non-idle)
         _dbg_p2_to = 0   # phase-2 timeouts (TLAST never arrived)
         _dbg_ok    = 0   # successful captures
+        _skip_arm  = False   # True when DMA was already re-armed mid-loop
 
         while self._running:
             try:
@@ -276,25 +277,27 @@ class EdmServer:
                 ))
                 _dbg_iter += 1
 
-                # If DMA is halted (error or reset needed), recover before arming.
-                st_before = self._dma.read(DMA_S2MM_STATUS)
-                if st_before & self._DMA_HALTED:
-                    self._dma.write(DMA_S2MM_CONTROL, 0x0004)   # reset
-                    time.sleep(0.002)
-                    self._dma.write(DMA_S2MM_CONTROL, 0x0001)   # RS=1
-                    time.sleep(0.001)
-                # Clear sticky status bits (IOC_Irq, Err_Irq) by W1C before arming.
-                self._dma.write(DMA_S2MM_STATUS, 0x7000)
+                if not _skip_arm:
+                    # If DMA is halted (error or reset needed), recover before arming.
+                    st_before = self._dma.read(DMA_S2MM_STATUS)
+                    if st_before & self._DMA_HALTED:
+                        self._dma.write(DMA_S2MM_CONTROL, 0x0004)   # reset
+                        time.sleep(0.002)
+                        self._dma.write(DMA_S2MM_CONTROL, 0x0001)   # RS=1
+                        time.sleep(0.001)
+                    # Clear sticky status bits (IOC_Irq, Err_Irq) by W1C before arming.
+                    self._dma.write(DMA_S2MM_STATUS, 0x7000)
 
-                # Arm: destination address then length (length write starts transfer)
-                self._dma.write(DMA_S2MM_DST_ADDR, self._buf_phys & 0xFFFFFFFF)
-                self._dma.write(DMA_S2MM_LENGTH,   capture_len * 4)
-                st_after  = self._dma.read(DMA_S2MM_STATUS)
+                    # Arm: destination address then length (length write starts transfer)
+                    self._dma.write(DMA_S2MM_DST_ADDR, self._buf_phys & 0xFFFFFFFF)
+                    self._dma.write(DMA_S2MM_LENGTH,   capture_len * 8)  # ×8: HP0 writes at 64-bit stride
+                    st_after  = self._dma.read(DMA_S2MM_STATUS)
 
-                if _dbg_iter <= 5 or _dbg_iter % 200 == 0:
-                    print(f"DMA arm #{_dbg_iter}: status before=0x{st_before:04X} "
-                          f"after=0x{st_after:04X} cap={capture_len} "
-                          f"p1_to={_dbg_p1_to} p2_to={_dbg_p2_to} ok={_dbg_ok}")
+                    if _dbg_iter <= 5 or _dbg_iter % 200 == 0:
+                        print(f"DMA arm #{_dbg_iter}: status before=0x{st_before:04X} "
+                              f"after=0x{st_after:04X} cap={capture_len} "
+                              f"p1_to={_dbg_p1_to} p2_to={_dbg_p2_to} ok={_dbg_ok}")
+                _skip_arm = False
 
                 # Phase 1: wait for DMA to go non-idle (Idle=0), max 200 ms.
                 # A very fast capture (<100 µs) may complete before our first
@@ -353,29 +356,33 @@ class EdmServer:
                 _dbg_ok += 1
                 last_wf_count = wf_count
 
+                # Read buffer immediately while DMA is idle (before re-arming).
+                # Parse buffer: {ch1[11:0], 4'b0, ch2[11:0], 4'b0}
+                #
+                # HP0 port quirk: despite 32-bit configuration, the Zynq HP port
+                # writes each 32-bit DMA word at 8-byte (64-bit) stride.  Valid
+                # data lands at even uint32 indices; odd indices are untouched.
+                self._buf.invalidate()
+                words   = np.array(self._buf[:capture_len * 2:2], dtype=np.uint32)
+                n_pairs = capture_len
+                ch1_raw = ((words[:n_pairs] >> 20) & 0xFFF).astype(np.float32)
+                ch2_raw = ((words[:n_pairs] >> 4)  & 0xFFF).astype(np.float32)
+                ch1_v   = (ch1_raw / 4096.0 * CH1_DIVIDER * CH1_PROBE).tolist()
+                ch2_v   = (ch2_raw / 4096.0 * CH2_RANGE).tolist()
+
+                # Re-arm DMA immediately after reading so next pulse is captured
+                # even if broadcast (TCP sendall) blocks for several milliseconds.
+                self._dma.write(DMA_S2MM_STATUS, 0x7000)
+                self._dma.write(DMA_S2MM_DST_ADDR, self._buf_phys & 0xFFFFFFFF)
+                self._dma.write(DMA_S2MM_LENGTH,   capture_len * 8)  # ×8: HP0 writes at 64-bit stride
+                _skip_arm = True   # skip redundant re-arm at top of next iteration
+
                 # Rate-limit broadcasts: max 100 bursts/s to the console.
-                # The DMA captures every pulse; we just don't flood the TCP link.
+                # DMA is already running; safe to skip a TX without missing captures.
                 now = time.time()
                 if now - _last_tx < 0.01:
                     continue
                 _last_tx = now
-
-                # Flush CPU cache so we read DMA-written values, not stale cache
-                self._buf.invalidate()
-                # Parse buffer: {ch1[11:0], 4'b0, ch2[11:0], 4'b0}
-                #
-                # The XADC simultaneous-mode sequencer fires two EOCs per cycle.
-                # Both EOCs trigger pair_ready; the resulting DMA words alternate:
-                #   even words: {ch1_valid, ch2_valid}  — paired sample
-                #   odd  words: 0x00000000              — dropped/skipped by DMA back-pressure
-                # Extract both channels from even words; discard odd zeros.
-                words   = np.array(self._buf[:capture_len], dtype=np.uint32)
-                # Interleave reconstruction: both channels from even words
-                n_pairs = capture_len // 2
-                ch1_raw = ((words[0::2][:n_pairs] >> 20) & 0xFFF).astype(np.float32)
-                ch2_raw = ((words[0::2][:n_pairs] >> 4)  & 0xFFF).astype(np.float32)
-                ch1_v   = (ch1_raw / 4096.0 * CH1_DIVIDER * CH1_PROBE).tolist()
-                ch2_v   = (ch2_raw / 4096.0 * CH2_RANGE).tolist()
 
                 frame = json.dumps({
                     'type':           'burst',
@@ -387,6 +394,7 @@ class EdmServer:
                 self._broadcast(frame)
 
             except Exception as e:
+                _skip_arm = False
                 print(f"DMA error: {e}")
                 time.sleep(0.1)
 
@@ -481,7 +489,7 @@ class EdmServer:
         srv.listen(4)
         print(f"EDM server listening on port {TCP_PORT}")
         print(f"  Status stream:  200 Hz JSON (type='status')")
-        print(f"  Burst stream:   per-pulse JSON (type='burst'), 500 kSPS per channel")
+        print(f"  Burst stream:   per-pulse JSON (type='burst'), ~500 kSPS per channel")
         print("Ctrl-C to stop.")
 
         try:

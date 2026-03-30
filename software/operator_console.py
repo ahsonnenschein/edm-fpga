@@ -687,14 +687,16 @@ class OperatorConsole(QMainWindow):
     def _apply_params(self):
         ton  = self._ton_spin.value()
         toff = self._toff_spin.value()
-        caplen = ton + toff          # one complete pulse cycle
+        window_us = ton + toff        # one complete pulse cycle in µs
+        caplen = int(window_us * 500_000 / 1_000_000)  # µs → samples at 500 kSPS
+        caplen = max(1, min(caplen, 1024))
         self._worker.send_cmd({'cmd': 'set_ton',         'value': ton})
         self._worker.send_cmd({'cmd': 'set_toff',        'value': toff})
-        self._worker.send_cmd({'cmd': 'set_capture_len', 'value': min(caplen, 1024)})
-        self._caplen_spin.setValue(min(caplen, 1024))
+        self._worker.send_cmd({'cmd': 'set_capture_len', 'value': caplen})
+        self._caplen_spin.setValue(caplen)
         self._wave_widget.set_timing(ton, toff)
         self.statusBar().showMessage(
-            f"Parameters applied: Ton={ton}µs  Toff={toff}µs  Capture={min(caplen,1024)}µs"
+            f"Parameters applied: Ton={ton}µs  Toff={toff}µs  Capture={caplen} samples"
         )
 
     def _on_prescale_changed(self, value: int):

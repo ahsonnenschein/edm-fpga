@@ -1,68 +1,73 @@
 `timescale 1ns/1ps
-// xadc_drp_reader.v  (rev 6 — correct simultaneous-mode channel filtering)
+// xadc_drp_reader.v  (rev 15 — channel_out-gated reads, no register-clear hazard)
 //
-// XADC Wizard: simultaneous sampling mode, sequencer has two steps:
-//   Step 1: ADC-A=VP/VN  + ADC-B=VAUX8  → EOC, channel_out=0x03
-//   Step 2: ADC-A=VAUX1  + ADC-B=VAUX9  → EOC, channel_out=0x11
+// CONFIRMED XADC behaviour on this board (from temp_data diagnostic):
+//   channel_out alternates: 5'h03 (VP/VN) → 5'h16 (VAUX6) → 5'h03 → ...
+//   Two EOC pulses per XADC cycle, ~500 kHz each.
 //
-// We trigger DRP reads ONLY on the VAUX1 EOC (channel_out==0x11).
-// At that point:
-//   • DRP addr 0x03 holds VP/VN result from Step 1 (~1 µs stale, acceptable)
-//   • DRP addr 0x11 holds VAUX1 result, freshly written by Step 2
-// This yields truly matched (VP/VN, VAUX1) pairs at 500 kHz.
+// ROOT CAUSE of "every other sample zero" in revs 12-14:
+//   The XADC clears result register 0x03 at the START of each VP/VN conversion,
+//   not at the end.  The VAUX6 EOC fires while VP/VN is converting, so reading
+//   0x03 at VAUX6-EOC time returns 0.  Phase-alternating and read-both approaches
+//   all hit this window on every other EOC.
 //
-// Filtering on channel_out avoids:
-//   - Reading stale VAUX9 (0x19) which is unconnected → ch2=0 bug
-//   - Double pair_ready rate (2× EOCs per XADC cycle) → wrong timescale bug
+// FIX: Only read each register when channel_out confirms that channel just
+//      finished converting (register is guaranteed valid):
 //
-// Each DRP read takes ~2 DCLK cycles for DRDY (100 MHz = 20 ns each),
-// so both reads complete in ~80 ns — well within the 2 µs EOC interval.
+//   channel_out==5'h03  →  read 0x03 → store ch1_data
+//   channel_out==5'h16  →  read 0x16 → store ch2_data, fire pair_ready
+//   all other channel_out values → ignored
 //
-// temp_data is not updated (temperature channel is disabled in this mode).
+// pair_ready fires at the VAUX6-EOC rate (~500 kHz).
+// ch1_data is one XADC cycle stale relative to ch2_data — acceptable (~2 µs).
 
 module xadc_drp_reader (
     input  wire        clk,
     input  wire        rst_n,
 
-    // DRP outputs from XADC Wizard (ENABLE_DRP mode)
-    input  wire [4:0]  channel_out,   // XADC channel indicator at EOC
-    input  wire        eoc_out,       // end-of-conversion pulse (1 cycle)
-    input  wire [15:0] do_out,        // DRP data output (valid when drdy_out=1)
-    input  wire        drdy_out,      // DRP data ready pulse
+    // DRP outputs from XADC Wizard
+    input  wire [4:0]  channel_out,
+    input  wire        eoc_out,
+    input  wire [15:0] do_out,
+    input  wire        drdy_out,
 
     // DRP inputs to XADC Wizard
-    output reg  [6:0]  daddr_in,      // DRP read address
-    output reg         den_in,        // DRP enable (1 cycle read strobe)
-    output wire        dwe_in,        // tie 0 — read only
-    output wire [15:0] di_in,         // tie 0 — read only
+    output reg  [6:0]  daddr_in,
+    output reg         den_in,
+    output wire        dwe_in,
+    output wire [15:0] di_in,
 
     // Decoded outputs
-    output reg  [11:0] ch1_data,      // VP/VN  (DRP addr 0x03)
-    output reg  [11:0] ch2_data,      // VAUX1  (DRP addr 0x11)
-    output reg  [11:0] temp_data,     // not updated (temp channel disabled)
+    output reg  [11:0] ch1_data,    // VP/VN result (DRP 0x03), updated at VP/VN EOC
+    output reg  [11:0] ch2_data,    // VAUX6 result (DRP 0x16), updated at VAUX6 EOC
+    output reg  [11:0] temp_data,   // channel_out at last EOC (diagnostic)
 
-    // Pulses when a fresh (ch1, ch2) pair is ready — 500 kHz
-    output reg         pair_ready
+    output reg         pair_ready   // fires at VAUX6-EOC rate (~500 kHz)
 );
 
 assign dwe_in = 1'b0;
 assign di_in  = 16'h0;
 
-localparam ADDR_CH1  = 7'h03;   // VP/VN result register (ADC-A)
-localparam ADDR_CH2  = 7'h11;   // VAUX1 result register (ADC-A, Step 2)
-localparam CH2_EOC   = 5'h11;   // channel_out value when Step-2 EOC fires (VAUX1=0x11)
+localparam ADDR_CH1  = 7'h03;   // VP/VN result register
+localparam ADDR_CH2  = 7'h16;   // VAUX6 result register (J1 A0)
+localparam CH_VP_VN  = 5'h03;   // channel_out code for VP/VN conversion done
+localparam CH_VAUX6  = 5'h16;   // channel_out code for VAUX6 conversion done
 
 localparam S_IDLE  = 3'd0;
-localparam S_READ1 = 3'd1;   // DEN asserted for ch1
-localparam S_WAIT1 = 3'd2;   // waiting for DRDY ch1
-localparam S_READ2 = 3'd3;   // DEN asserted for ch2
-localparam S_WAIT2 = 3'd4;   // waiting for DRDY ch2 → fire pair_ready
+localparam S_READ  = 3'd1;   // DEN asserted for one cycle
+localparam S_WAIT  = 3'd2;   // waiting for DRDY
+
+// which result to store after DRDY
+localparam DEST_CH1 = 1'b0;
+localparam DEST_CH2 = 1'b1;
 
 reg [2:0] state;
+reg       dest;   // 0 = store into ch1_data, 1 = store into ch2_data + fire pair_ready
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         state      <= S_IDLE;
+        dest       <= DEST_CH1;
         daddr_in   <= 7'd0;
         den_in     <= 1'b0;
         ch1_data   <= 12'd0;
@@ -70,42 +75,44 @@ always @(posedge clk or negedge rst_n) begin
         temp_data  <= 12'd0;
         pair_ready <= 1'b0;
     end else begin
-        den_in     <= 1'b0;   // deasserted by default every cycle
+        den_in     <= 1'b0;
         pair_ready <= 1'b0;
 
         case (state)
             S_IDLE: begin
-                // Only trigger on VAUX1 EOC (Step 2); skip VP/VN EOC (Step 1).
-                if (eoc_out && channel_out == CH2_EOC) begin
-                    daddr_in <= ADDR_CH1;
-                    den_in   <= 1'b1;
-                    state    <= S_READ1;
+                if (eoc_out) begin
+                    temp_data <= {7'd0, channel_out};
+                    if (channel_out == CH_VP_VN) begin
+                        // VP/VN conversion just finished — register 0x03 is valid now
+                        daddr_in <= ADDR_CH1;
+                        den_in   <= 1'b1;
+                        dest     <= DEST_CH1;
+                        state    <= S_READ;
+                    end else if (channel_out == CH_VAUX6) begin
+                        // VAUX6 conversion just finished — register 0x16 is valid now
+                        daddr_in <= ADDR_CH2;
+                        den_in   <= 1'b1;
+                        dest     <= DEST_CH2;
+                        state    <= S_READ;
+                    end
+                    // all other channel_out codes (calibration etc.) — ignore
                 end
             end
 
-            S_READ1: begin
+            S_READ: begin
                 // DEN was high last cycle; deasserted by default above.
-                state <= S_WAIT1;
+                state <= S_WAIT;
             end
 
-            S_WAIT1: begin
+            S_WAIT: begin
                 if (drdy_out) begin
-                    ch1_data <= do_out[15:4];
-                    daddr_in <= ADDR_CH2;
-                    den_in   <= 1'b1;
-                    state    <= S_READ2;
-                end
-            end
-
-            S_READ2: begin
-                state <= S_WAIT2;
-            end
-
-            S_WAIT2: begin
-                if (drdy_out) begin
-                    ch2_data   <= do_out[15:4];
-                    pair_ready <= 1'b1;
-                    state      <= S_IDLE;
+                    if (dest == DEST_CH1) begin
+                        ch1_data <= do_out[15:4];
+                    end else begin
+                        ch2_data   <= do_out[15:4];
+                        pair_ready <= 1'b1;
+                    end
+                    state <= S_IDLE;
                 end
             end
 
