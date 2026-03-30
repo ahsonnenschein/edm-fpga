@@ -125,7 +125,7 @@ axi_edm_regs #(
 );
 
 // ── EDM pulse state machine ────────────────────────────
-wire trigger_unused;
+wire pulse_trigger;   // single-cycle pulse at each Ton rising edge
 edm_pulse_ctrl u_pulse (
     .clk         (S_AXI_ACLK),
     .rst_n       (S_AXI_ARESETN),
@@ -133,7 +133,7 @@ edm_pulse_ctrl u_pulse (
     .ton_cycles  (ton_cycles),
     .toff_cycles (toff_cycles),
     .pulse_out   (pulse_internal),
-    .trigger     (trigger_unused),
+    .trigger     (pulse_trigger),
     .pulse_count (pulse_count)
 );
 
@@ -141,7 +141,8 @@ edm_pulse_ctrl u_pulse (
 waveform_capture u_cap (
     .clk            (S_AXI_ACLK),
     .rst_n          (S_AXI_ARESETN),
-    .trigger        (pulse_out),
+    .trigger        (pulse_trigger & hv_enable_sync),
+    .pulse_state    (pulse_out),
     .ch1_data       (xadc_ch1_raw),
     .ch2_data       (xadc_ch2_raw),
     .pair_ready     (pair_ready),

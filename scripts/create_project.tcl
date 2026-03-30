@@ -43,7 +43,6 @@ create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 ps7
 set_property -dict [list \
     CONFIG.PCW_PRESET_BANK0_VOLTAGE      {LVCMOS 3.3V} \
     CONFIG.PCW_PRESET_BANK1_VOLTAGE      {LVCMOS 1.8V} \
-    CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ  {100.000000} \
     CONFIG.PCW_USE_M_AXI_GP0             {1} \
     CONFIG.PCW_EN_CLK0_PORT              {1} \
     CONFIG.PCW_EN_RST0_PORT              {1} \
@@ -55,10 +54,13 @@ set_property -dict [list \
 apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \
     -config {make_external "FIXED_IO, DDR"} [get_bd_cells ps7]
 
+# Re-apply FCLK after automation (apply_bd_automation can override PLL settings)
+set_property CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {100.000000} [get_bd_cells ps7]
+
 # ── XADC Wizard ────────────────────────────────────────
-# Simultaneous sampling mode: ADC-A samples VP/VN, ADC-B samples VAUX1,
-# both at 1 MSPS.  One EOC fires per pair; xadc_drp_reader issues two
-# back-to-back DRP reads (0x03 then 0x11) to recover both values.
+# Simultaneous sampling mode: ADC-A samples VP/VN, ADC-B samples VAUX6,
+# both at 1 MSPS.  One EOC fires per pair; xadc_drp_reader reads each
+# channel's result register when channel_out confirms conversion done.
 # Temperature channel is disabled (not available in simultaneous mode).
 #
 # NOTE: if Vivado rejects XADC_STARUP_SELECTION {simultaneous_sampling},
@@ -69,14 +71,15 @@ set_property -dict [list \
     CONFIG.INTERFACE_SELECTION       {ENABLE_DRP} \
     CONFIG.XADC_STARUP_SELECTION     {simultaneous_sampling} \
     CONFIG.CHANNEL_ENABLE_VP_VN      {true} \
-    CONFIG.CHANNEL_ENABLE_VAUXP1_VAUXN1 {true} \
+    CONFIG.CHANNEL_ENABLE_VAUXP6_VAUXN6 {true} \
     CONFIG.TIMING_MODE               {Continuous} \
     CONFIG.DCLK_FREQUENCY            {100} \
     CONFIG.ADC_CONVERSION_RATE       {1000} \
 ] [get_bd_cells xadc_wiz_0]
 
-# Expose VP/VN analog input
+# Expose VP/VN and VAUX6 analog inputs
 make_bd_intf_pins_external [get_bd_intf_pins xadc_wiz_0/Vp_Vn]
+make_bd_intf_pins_external [get_bd_intf_pins xadc_wiz_0/Vaux6]
 
 # Tie DRP write-side inputs to 0 (read-only DRP master in edm_ctrl)
 create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 const_0

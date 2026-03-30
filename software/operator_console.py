@@ -3,7 +3,7 @@
 operator_console.py  —  EDM Controller Operator Console (PYNQ-Z2)
 
 Left panel:  Connection | Parameters | Status
-Right panel: Per-burst waveform (CH1 gap voltage, CH2 arc current) + statistics
+Right panel: Per-burst waveform (CH1 arc current, CH2 gap voltage) + statistics
 
 Waveform display shows the most recent continuous block of samples where
 'enable' was active (sparks running), subsampled by the prescale factor.
@@ -42,7 +42,7 @@ HIST_BUF_MAX    = 12_000    # 1 min at 200 Hz
 # ─────────────────────────────────────────────────────────────────────────────
 class WorkerSignals(QObject):
     sample_ready  = Signal(float, float, float)   # ch1, ch2, ts  (status frame)
-    burst_ready   = Signal(object, object)         # ch1_list, ch2_list (burst frame)
+    burst_ready   = Signal(object, object, object)  # ch1_list, ch2_list, pulse_list (burst frame)
     status_update = Signal(dict)
     connection_ok = Signal(bool)
     error         = Signal(str)
@@ -105,6 +105,7 @@ class PollWorker:
                                 self.signals.burst_ready.emit(
                                     d.get('ch1', []),
                                     d.get('ch2', []),
+                                    d.get('pulse', []),
                                 )
                             else:
                                 self.signals.sample_ready.emit(
@@ -165,11 +166,11 @@ class WaveformWidget(QWidget):
             for spine in ax.spines.values():
                 spine.set_edgecolor('#444444')
 
-        self.ax1.set_ylabel("Gap Voltage (V)", color='#cccccc', fontsize=8)
+        self.ax1.set_ylabel("Arc Current (V)", color='#cccccc', fontsize=8)
         self.ax1.margins(y=0.12)
         self.ax1.yaxis.label.set_color('#cccccc')
 
-        self.ax2.set_ylabel("Arc Current proxy (V)", color='#cccccc', fontsize=8)
+        self.ax2.set_ylabel("Gap Voltage (V)", color='#cccccc', fontsize=8)
         self.ax2.set_xlabel("Time (s)  [status stream — enable pulses to see burst waveforms]", color='#cccccc', fontsize=8)
         self.ax2.margins(y=0.12)
         self.ax2.yaxis.label.set_color('#cccccc')
@@ -178,9 +179,9 @@ class WaveformWidget(QWidget):
         self.line2, = self.ax2.plot([], [], color='#F44336', lw=0.8)
 
         self._title1 = self.ax1.set_title(
-            "CH1 – Gap Voltage", color='#cccccc', fontsize=9)
+            "CH1 – Arc Current", color='#cccccc', fontsize=9)
         self._title2 = self.ax2.set_title(
-            "CH2 – Arc Current (GEDM output)", color='#cccccc', fontsize=9)
+            "CH2 – Gap Voltage", color='#cccccc', fontsize=9)
 
         self.canvas = FigureCanvas(self.fig)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -191,7 +192,7 @@ class WaveformWidget(QWidget):
     def add_sample(self, ch1: float, ch2: float, ts: float, enable: bool):
         self._buf.append((ts, ch1, ch2, enable))
 
-    def add_burst(self, ch1_list: list, ch2_list: list):
+    def add_burst(self, ch1_list: list, ch2_list: list, pulse_list: list = None):
         """Append a DMA burst to the overlay history (up to 10 kept)."""
         if not ch1_list:
             return
@@ -199,7 +200,8 @@ class WaveformWidget(QWidget):
         t   = np.arange(n, dtype=np.float32) / 500_000 * 1e6   # µs at 500 kSPS (one valid pair per 2 µs)
         ch1 = np.array(ch1_list, dtype=np.float32)
         ch2 = np.array(ch2_list, dtype=np.float32)
-        self._burst_history.append((t, ch1, ch2))
+        pulse = np.array(pulse_list, dtype=np.int32) if pulse_list else np.zeros(n, dtype=np.int32)
+        self._burst_history.append((t, ch1, ch2, pulse))
 
     def set_prescale(self, n: int):
         self._prescale = max(1, n)   # kept for internal use; pulse decimation is in OperatorConsole
@@ -276,7 +278,7 @@ class WaveformWidget(QWidget):
         dur_ms    = window_s * 1000
 
         self._title1.set_text(
-            f"CH1 – Gap Voltage  [last {self.PULSE_WINDOW} pulses "
+            f"CH1 – Arc Current  [last {self.PULSE_WINDOW} pulses "
             f"({dur_ms:.3g} ms), {n_total} samples, 1/{n} shown — {state_tag}]"
         )
         self.canvas.draw_idle()
@@ -294,7 +296,7 @@ class WaveformWidget(QWidget):
                 spine.set_edgecolor('#444444')
 
         x_max = 1.0
-        for i, (t, ch1, ch2) in enumerate(history):
+        for i, (t, ch1, ch2, pulse) in enumerate(history):
             alpha = 0.15 + 0.85 * (i + 1) / nb
             lw    = 0.5  + 0.6  * (i + 1) / nb
             # Show dots at each sample so zero-valued samples are visible
@@ -303,33 +305,39 @@ class WaveformWidget(QWidget):
                           marker='.', markersize=ms, markevery=1)
             self.ax2.plot(t, ch2, color='#F44336', alpha=alpha, lw=lw,
                           marker='.', markersize=ms, markevery=1)
+            # Shade pulse-on regions (most recent burst only)
+            if i == nb - 1 and pulse.any():
+                for ax in (self.ax1, self.ax2):
+                    ax.fill_between(t, 0, 1, where=pulse.astype(bool),
+                                    transform=ax.get_xaxis_transform(),
+                                    color='#FFEB3B', alpha=0.12, label='Ton')
             x_max = max(x_max, t[-1])
 
         self.ax1.set_xlim(0, x_max)
         self.ax2.set_xlim(0, x_max)
         self.ax1.margins(y=0.12); self.ax1.autoscale_view(scalex=False)
         self.ax2.margins(y=0.12); self.ax2.autoscale_view(scalex=False)
-        self.ax1.set_ylabel("Gap Voltage (V)",       color='#cccccc', fontsize=8)
-        self.ax2.set_ylabel("Arc Current proxy (V)", color='#cccccc', fontsize=8)
+        self.ax1.set_ylabel("Arc Current (V)",  color='#cccccc', fontsize=8)
+        self.ax2.set_ylabel("Gap Voltage (V)",  color='#cccccc', fontsize=8)
         self.ax2.set_xlabel("Time in pulse (µs)",    color='#cccccc', fontsize=8)
         n_samp = len(history[-1][0])
         self.ax1.set_title(
-            f"CH1 – Gap Voltage  [last {nb} pulses overlaid, {n_samp} samples @ 500 kSPS]",
+            f"CH1 – Arc Current  [last {nb} pulses overlaid, {n_samp} samples @ 500 kSPS]",
             color='#cccccc', fontsize=9)
-        self.ax2.set_title("CH2 – Arc Current (GEDM output)", color='#cccccc', fontsize=9)
+        self.ax2.set_title("CH2 – Gap Voltage", color='#cccccc', fontsize=9)
         self.canvas.draw_idle()
 
     def _show_idle(self):
         self.line1.set_data([], [])
         self.line2.set_data([], [])
-        self._title1.set_text("CH1 – Gap Voltage  [waiting for enable…]")
+        self._title1.set_text("CH1 – Arc Current  [waiting for enable…]")
         self.canvas.draw_idle()
 
     # expose arrays for stats
     def last_burst_arrays(self):
         """Return (ch1_arr, ch2_arr) for the most recent burst, or empty arrays."""
         if self._burst_history:
-            _, ch1, ch2 = self._burst_history[-1]
+            _, ch1, ch2, _pulse = self._burst_history[-1]
             return ch1, ch2
         buf = list(self._buf)
         end = len(buf) - 1
@@ -369,11 +377,11 @@ class StatsWidget(QGroupBox):
         self._n_spin.setSuffix(" pulses")
         self._n_spin.valueChanged.connect(self._on_n_changed)
 
-        f.addRow("V avg Ton (V):",             self._v_peak)
-        f.addRow("CH2 avg Ton (V):",           self._ch2_peak)
+        f.addRow("CH1 current avg Ton (V):",    self._v_peak)
+        f.addRow("CH2 gap voltage avg Ton (V):", self._ch2_peak)
         f.addRow("Pulse rate (Hz):",           self._rate)
         f.addRow("Chip temp (°C):",            self._temp)
-        f.addRow("N pulse running avg gap V:", self._n_spin)
+        f.addRow("N pulse running avg:", self._n_spin)
         f.addRow("",                           self._v_ravg)
 
         self._ravg_buf = deque(maxlen=self._N_DEFAULT)
@@ -423,7 +431,7 @@ class StatsWidget(QGroupBox):
 # 1-minute voltage/current histogram
 # ─────────────────────────────────────────────────────────────────────────────
 class HistogramWidget(QWidget):
-    """Rolling 1-minute histogram of gap voltage (CH1) and arc current (CH2)."""
+    """Rolling 1-minute histogram of arc current (CH1) and gap voltage (CH2)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -468,8 +476,8 @@ class HistogramWidget(QWidget):
         secs = min(n / 200, 60)
 
         for ax, data, color, label, chan in [
-            (self.ax1, ch1, '#2196F3', 'Gap Voltage (V)',        'CH1'),
-            (self.ax2, ch2, '#F44336', 'Arc Current proxy (V)',  'CH2'),
+            (self.ax1, ch1, '#2196F3', 'Arc Current (V)',   'CH1'),
+            (self.ax2, ch2, '#F44336', 'Gap Voltage (V)',  'CH2'),
         ]:
             ax.cla()
             ax.set_facecolor('#1e1e1e')
@@ -711,14 +719,14 @@ class OperatorConsole(QMainWindow):
         self._wave_widget.add_sample(ch1, ch2, ts, self._last_enable)
         self._hist_widget.add_sample(ch1, ch2)
 
-    def _on_burst(self, ch1_list, ch2_list):
+    def _on_burst(self, ch1_list, ch2_list, pulse_list):
         self._burst_rx_count = getattr(self, '_burst_rx_count', 0) + 1
         decimation = self._prescale_spin.value()
         # Every pulse feeds the histogram; only 1-in-N feeds the waveform overlay.
         ch1_arr = np.array(ch1_list, dtype=np.float32)
         ch2_arr = np.array(ch2_list, dtype=np.float32)
         if self._burst_rx_count % decimation == 0:
-            self._wave_widget.add_burst(ch1_list, ch2_list)
+            self._wave_widget.add_burst(ch1_list, ch2_list, pulse_list)
         self._hist_widget.add_burst(ch1_arr, ch2_arr)
 
     def _on_status(self, d: dict):

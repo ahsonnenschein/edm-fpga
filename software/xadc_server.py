@@ -133,6 +133,18 @@ class EdmServer:
         time.sleep(1)
         print("Overlay loaded.")
 
+        # Force FCLK_CLK0 to 100 MHz — apply_bd_automation can override PLL
+        # settings during the Vivado build, so the bitstream may boot with the
+        # wrong frequency.  Setting it here guarantees the pulse controller and
+        # all cycle-count registers use the expected 100 MHz timebase.
+        from pynq import Clocks
+        actual = Clocks.fclk0_mhz
+        if abs(actual - 100.0) > 1.0:
+            print(f"FCLK_CLK0 was {actual:.1f} MHz — forcing to 100 MHz")
+            Clocks.fclk0_mhz = 100.0
+        else:
+            print(f"FCLK_CLK0 = {actual:.1f} MHz (OK)")
+
         # Enable PS UART1 (/dev/ttyPS1) via DT overlay now that ps7_init has
         # run and UART1 is clocked.  The dtbo is compiled once and stored in
         # /boot/uart1.dtbo; this is a no-op if already applied.
@@ -357,7 +369,7 @@ class EdmServer:
                 last_wf_count = wf_count
 
                 # Read buffer immediately while DMA is idle (before re-arming).
-                # Parse buffer: {ch1[11:0], 4'b0, ch2[11:0], 4'b0}
+                # Parse buffer: {ch1[11:0], 4'b0, ch2[11:0], 3'b0, pulse_state}
                 #
                 # HP0 port quirk: despite 32-bit configuration, the Zynq HP port
                 # writes each 32-bit DMA word at 8-byte (64-bit) stride.  Valid
@@ -367,6 +379,7 @@ class EdmServer:
                 n_pairs = capture_len
                 ch1_raw = ((words[:n_pairs] >> 20) & 0xFFF).astype(np.float32)
                 ch2_raw = ((words[:n_pairs] >> 4)  & 0xFFF).astype(np.float32)
+                pulse_bits = (words[:n_pairs] & 0x1).astype(np.int32)
                 ch1_v   = (ch1_raw / 4096.0 * CH1_DIVIDER * CH1_PROBE).tolist()
                 ch2_v   = (ch2_raw / 4096.0 * CH2_RANGE).tolist()
 
@@ -389,6 +402,7 @@ class EdmServer:
                     'waveform_count': int(wf_count),
                     'ch1':            [round(v, 4) for v in ch1_v],
                     'ch2':            [round(v, 4) for v in ch2_v],
+                    'pulse':          pulse_bits.tolist(),
                 }).encode() + b'\n'
 
                 self._broadcast(frame)

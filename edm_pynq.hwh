@@ -1,5 +1,5 @@
 ﻿<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
-<EDKSYSTEM EDWVERSION="1.2" TIMESTAMP="Sat Mar 28 09:12:06 2026" VIVADOVERSION="2023.2">
+<EDKSYSTEM EDWVERSION="1.2" TIMESTAMP="Mon Mar 30 09:17:26 2026" VIVADOVERSION="2023.2">
 
   <SYSTEMINFO ARCH="zynq" DEVICE="7z020" NAME="edm_system" PACKAGE="clg400" SPEEDGRADE="-1"/>
 
@@ -109,6 +109,16 @@
         <CONNECTION INSTANCE="ps7" PORT="PS_SRSTB"/>
       </CONNECTIONS>
     </PORT>
+    <PORT DIR="I" NAME="Vaux6_0_v_n" SIGIS="undef" SIGNAME="xadc_wiz_0_vauxn6">
+      <CONNECTIONS>
+        <CONNECTION INSTANCE="xadc_wiz_0" PORT="vauxn6"/>
+      </CONNECTIONS>
+    </PORT>
+    <PORT DIR="I" NAME="Vaux6_0_v_p" SIGIS="undef" SIGNAME="xadc_wiz_0_vauxp6">
+      <CONNECTIONS>
+        <CONNECTION INSTANCE="xadc_wiz_0" PORT="vauxp6"/>
+      </CONNECTIONS>
+    </PORT>
     <PORT DIR="I" NAME="Vp_Vn_0_v_n" SIGIS="undef" SIGNAME="xadc_wiz_0_vn_in">
       <CONNECTIONS>
         <CONNECTION INSTANCE="xadc_wiz_0" PORT="vn_in"/>
@@ -210,6 +220,12 @@
       <PORTMAPS>
         <PORTMAP LOGICAL="V_N" PHYSICAL="Vp_Vn_0_v_n"/>
         <PORTMAP LOGICAL="V_P" PHYSICAL="Vp_Vn_0_v_p"/>
+      </PORTMAPS>
+    </BUSINTERFACE>
+    <BUSINTERFACE BUSNAME="External_Interface_Vaux6_0" NAME="Vaux6_0" TYPE="TARGET">
+      <PORTMAPS>
+        <PORTMAP LOGICAL="V_N" PHYSICAL="Vaux6_0_v_n"/>
+        <PORTMAP LOGICAL="V_P" PHYSICAL="Vaux6_0_v_p"/>
       </PORTMAPS>
     </BUSINTERFACE>
   </EXTERNALINTERFACES>
@@ -4519,7 +4535,7 @@
         <PARAMETER NAME="C_INCLUDE_INTR" VALUE="1"/>
         <PARAMETER NAME="C_SAMPLING_RATE" VALUE="961538.4615384615"/>
         <PARAMETER NAME="C_SEQUENCE_R0" VALUE="2048"/>
-        <PARAMETER NAME="C_SEQUENCE_R1" VALUE="514"/>
+        <PARAMETER NAME="C_SEQUENCE_R1" VALUE="16448"/>
         <PARAMETER NAME="C_SEQUENCE_R2" VALUE="0"/>
         <PARAMETER NAME="C_SEQUENCE_R3" VALUE="0"/>
         <PARAMETER NAME="C_SEQUENCE_R4" VALUE="0"/>
@@ -4530,20 +4546,20 @@
         <PARAMETER NAME="C_SIM_FILE_REL_PATH" VALUE="./"/>
         <PARAMETER NAME="C_SIM_FILE_SEL" VALUE="Default"/>
         <PARAMETER NAME="C_VAUX0" VALUE="0"/>
-        <PARAMETER NAME="C_VAUX1" VALUE="1"/>
+        <PARAMETER NAME="C_VAUX1" VALUE="0"/>
         <PARAMETER NAME="C_VAUX2" VALUE="0"/>
         <PARAMETER NAME="C_VAUX3" VALUE="0"/>
         <PARAMETER NAME="C_VAUX4" VALUE="0"/>
         <PARAMETER NAME="C_VAUX5" VALUE="0"/>
-        <PARAMETER NAME="C_VAUX6" VALUE="0"/>
+        <PARAMETER NAME="C_VAUX6" VALUE="1"/>
         <PARAMETER NAME="C_VAUX7" VALUE="0"/>
         <PARAMETER NAME="C_VAUX8" VALUE="0"/>
-        <PARAMETER NAME="C_VAUX9" VALUE="1"/>
+        <PARAMETER NAME="C_VAUX9" VALUE="0"/>
         <PARAMETER NAME="C_VAUX10" VALUE="0"/>
         <PARAMETER NAME="C_VAUX11" VALUE="0"/>
         <PARAMETER NAME="C_VAUX12" VALUE="0"/>
         <PARAMETER NAME="C_VAUX13" VALUE="0"/>
-        <PARAMETER NAME="C_VAUX14" VALUE="0"/>
+        <PARAMETER NAME="C_VAUX14" VALUE="1"/>
         <PARAMETER NAME="C_VAUX15" VALUE="0"/>
         <PARAMETER NAME="c_component_name" VALUE="edm_system_xadc_wiz_0_0"/>
         <PARAMETER NAME="ACQUISITION_TIME" VALUE="4"/>
@@ -4618,17 +4634,17 @@
         <PARAMETER NAME="CHANNEL_ENABLE_VAUXP11_VAUXN11" VALUE="false"/>
         <PARAMETER NAME="CHANNEL_ENABLE_VAUXP12_VAUXN12" VALUE="false"/>
         <PARAMETER NAME="CHANNEL_ENABLE_VAUXP13_VAUXN13" VALUE="false"/>
-        <PARAMETER NAME="CHANNEL_ENABLE_VAUXP14_VAUXN14" VALUE="false"/>
+        <PARAMETER NAME="CHANNEL_ENABLE_VAUXP14_VAUXN14" VALUE="true"/>
         <PARAMETER NAME="CHANNEL_ENABLE_VAUXP15_VAUXN15" VALUE="false"/>
-        <PARAMETER NAME="CHANNEL_ENABLE_VAUXP1_VAUXN1" VALUE="true"/>
+        <PARAMETER NAME="CHANNEL_ENABLE_VAUXP1_VAUXN1" VALUE="false"/>
         <PARAMETER NAME="CHANNEL_ENABLE_VAUXP2_VAUXN2" VALUE="false"/>
         <PARAMETER NAME="CHANNEL_ENABLE_VAUXP3_VAUXN3" VALUE="false"/>
         <PARAMETER NAME="CHANNEL_ENABLE_VAUXP4_VAUXN4" VALUE="false"/>
         <PARAMETER NAME="CHANNEL_ENABLE_VAUXP5_VAUXN5" VALUE="false"/>
-        <PARAMETER NAME="CHANNEL_ENABLE_VAUXP6_VAUXN6" VALUE="false"/>
+        <PARAMETER NAME="CHANNEL_ENABLE_VAUXP6_VAUXN6" VALUE="true"/>
         <PARAMETER NAME="CHANNEL_ENABLE_VAUXP7_VAUXN7" VALUE="false"/>
         <PARAMETER NAME="CHANNEL_ENABLE_VAUXP8_VAUXN8" VALUE="false"/>
-        <PARAMETER NAME="CHANNEL_ENABLE_VAUXP9_VAUXN9" VALUE="true"/>
+        <PARAMETER NAME="CHANNEL_ENABLE_VAUXP9_VAUXN9" VALUE="false"/>
         <PARAMETER NAME="CHANNEL_ENABLE_VBRAM" VALUE="false"/>
         <PARAMETER NAME="CHANNEL_ENABLE_VCCAUX" VALUE="false"/>
         <PARAMETER NAME="CHANNEL_ENABLE_VCCDDRO" VALUE="false"/>
@@ -4759,10 +4775,18 @@
         <PORT DIR="O" NAME="ot_out" SIGIS="undef"/>
         <PORT DIR="I" NAME="reset_in" POLARITY="ACTIVE_HIGH" SIGIS="rst"/>
         <PORT DIR="O" NAME="user_temp_alarm_out" SIGIS="undef"/>
-        <PORT DIR="I" NAME="vauxn1" SIGIS="undef"/>
-        <PORT DIR="I" NAME="vauxn9" SIGIS="undef"/>
-        <PORT DIR="I" NAME="vauxp1" SIGIS="undef"/>
-        <PORT DIR="I" NAME="vauxp9" SIGIS="undef"/>
+        <PORT DIR="I" NAME="vauxn6" SIGIS="undef" SIGNAME="xadc_wiz_0_vauxn6">
+          <CONNECTIONS>
+            <CONNECTION INSTANCE="edm_system_imp" PORT="Vaux6_0_v_n"/>
+          </CONNECTIONS>
+        </PORT>
+        <PORT DIR="I" NAME="vauxn14" SIGIS="undef"/>
+        <PORT DIR="I" NAME="vauxp6" SIGIS="undef" SIGNAME="xadc_wiz_0_vauxp6">
+          <CONNECTIONS>
+            <CONNECTION INSTANCE="edm_system_imp" PORT="Vaux6_0_v_p"/>
+          </CONNECTIONS>
+        </PORT>
+        <PORT DIR="I" NAME="vauxp14" SIGIS="undef"/>
         <PORT DIR="O" NAME="vccaux_alarm_out" SIGIS="undef"/>
         <PORT DIR="O" NAME="vccddro_alarm_out" SIGIS="undef"/>
         <PORT DIR="O" NAME="vccint_alarm_out" SIGIS="undef"/>
@@ -4796,16 +4820,16 @@
             <PORTMAP LOGICAL="V_P" PHYSICAL="vp_in"/>
           </PORTMAPS>
         </BUSINTERFACE>
-        <BUSINTERFACE BUSNAME="__NOC__" NAME="Vaux1" TYPE="TARGET" VLNV="xilinx.com:interface:diff_analog_io:1.0">
+        <BUSINTERFACE BUSNAME="External_Interface_Vaux6_0" NAME="Vaux6" TYPE="TARGET" VLNV="xilinx.com:interface:diff_analog_io:1.0">
           <PORTMAPS>
-            <PORTMAP LOGICAL="V_N" PHYSICAL="vauxn1"/>
-            <PORTMAP LOGICAL="V_P" PHYSICAL="vauxp1"/>
+            <PORTMAP LOGICAL="V_N" PHYSICAL="vauxn6"/>
+            <PORTMAP LOGICAL="V_P" PHYSICAL="vauxp6"/>
           </PORTMAPS>
         </BUSINTERFACE>
-        <BUSINTERFACE BUSNAME="__NOC__" NAME="Vaux9" TYPE="TARGET" VLNV="xilinx.com:interface:diff_analog_io:1.0">
+        <BUSINTERFACE BUSNAME="__NOC__" NAME="Vaux14" TYPE="TARGET" VLNV="xilinx.com:interface:diff_analog_io:1.0">
           <PORTMAPS>
-            <PORTMAP LOGICAL="V_N" PHYSICAL="vauxn9"/>
-            <PORTMAP LOGICAL="V_P" PHYSICAL="vauxp9"/>
+            <PORTMAP LOGICAL="V_N" PHYSICAL="vauxn14"/>
+            <PORTMAP LOGICAL="V_P" PHYSICAL="vauxp14"/>
           </PORTMAPS>
         </BUSINTERFACE>
       </BUSINTERFACES>

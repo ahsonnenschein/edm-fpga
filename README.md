@@ -20,8 +20,8 @@ FPGA-based EDM (Electrical Discharge Machining) pulse controller running on the 
 | SoC | Xilinx Zynq-7020 (XC7Z020-1CLG400C) |
 | PL clock | 100 MHz (FCLK0 from PS) |
 | ADC | On-chip XADC, simultaneous sampling, 500 kSPS per channel, 12-bit |
-| CH1 | Gap voltage — VP/VN dedicated differential input (÷3 resistor divider, 0–1 V range) |
-| CH2 | Arc current — GEDM optoisolated output (0–3.3 V) → VAUXP1/VAUXN1 |
+| CH1 | Arc current — VP/VN dedicated differential input (GEDM current sense) |
+| CH2 | Gap voltage — Hantek HT8050 differential probe → VAUXP6/VAUXN6 (A0/A1) |
 | Pulse output | Arduino AR0 (T14) → GEDM pulse board |
 | HV enable input | Arduino AR1 (U12) ← operator toggle switch |
 | Green lamp | Arduino AR2 (U13) — HV off |
@@ -49,8 +49,8 @@ CH1 scaling: `CH1_DIVIDER = 3.0` in `xadc_server.py` — adjust to match your re
 
 | Board label | Signal | Connect to |
 |-------------|--------|------------|
-| A0 | VAUX1+ | Arc current sense + |
-| A1 | VAUX1− | Arc current sense − / GND |
+| A0 | VAUX6+ | Gap voltage probe + (Hantek HT8050 output) |
+| A1 | VAUX6− | Gap voltage probe − / GND |
 
 ### Digital — Arduino header J4, pins AR0–AR7 (3.3 V LVCMOS)
 
@@ -123,11 +123,11 @@ Zynq PS (ARM)
 
 PL fabric
     XADC Wizard (ENABLE_DRP, simultaneous sampling)
-        ├── ADC-A → VP/VN          (CH1 gap voltage)
-        └── ADC-B → VAUXP1/VAUXN1 (CH2 arc current)
+        ├── ADC-A → VP/VN          (CH1 arc current)
+        └── ADC-B → VAUXP6/VAUXN6 (CH2 gap voltage)
             │   both at 1 MSPS, one EOC per pair
             ▼
-    xadc_drp_reader  (two DRP reads per EOC: addr 0x03 → CH1, addr 0x11 → CH2)
+    xadc_drp_reader  (two DRP reads per EOC: addr 0x03 → CH1, addr 0x16 → CH2)
             │   pair_ready pulse at 500 kSPS
             ▼
     waveform_capture (triggered on pulse_out rising edge, captures capture_len samples)
@@ -148,17 +148,12 @@ PL fabric
 
 ### XADC simultaneous sampling
 
-`xadc_drp_reader.v` (rev 6) operates in simultaneous sampling mode with a two-step sequencer:
+`xadc_drp_reader.v` (rev 15) reads each channel's DRP result register only when `channel_out` confirms that channel just finished converting:
 
-- **Step 1**: ADC-A = VP/VN, ADC-B = VAUX8 → EOC, `channel_out = 0x03`
-- **Step 2**: ADC-A = VAUX1, ADC-B = VAUX9 → EOC, `channel_out = 0x11`
+- `channel_out == 0x03` (VP/VN EOC) → read DRP address `0x03` → store `ch1_data`
+- `channel_out == 0x16` (VAUX6 EOC) → read DRP address `0x16` → store `ch2_data` + fire `pair_ready`
 
-The module triggers only on the Step-2 EOC (`channel_out == 0x11`) and issues two DRP reads:
-
-1. Address `0x03` → CH1 (VP/VN result from Step 1, ~1 µs stale, acceptable)
-2. Address `0x11` → CH2 (VAUX1 result from Step 2, freshly written)
-
-Both reads complete in ~80 ns.  The `pair_ready` pulse triggers `waveform_capture` at 500 kSPS.  The XADC simultaneously fires two EOCs per full cycle; `waveform_capture` stores valid `{CH1, CH2}` pairs in every other DMA word — `xadc_server.py` reconstructs by extracting both channels from even-indexed words.
+`pair_ready` fires at the VAUX6-EOC rate (~500 kHz).  CH1 is one XADC cycle stale relative to CH2 (~2 µs) — acceptable for EDM monitoring.
 
 ---
 
@@ -235,8 +230,8 @@ sudo XILINX_XRT=/usr /usr/local/share/pynq-venv/bin/python3 /home/xilinx/xadc_se
 
 | Field | Description |
 |-------|-------------|
-| `ch1` | Gap voltage (V) — scaled through ÷3 probe divider |
-| `ch2` | Arc current proxy (V) — GEDM 0–3.3 V output |
+| `ch1` | Arc current (V) — GEDM current sense on VP/VN |
+| `ch2` | Gap voltage (V) — Hantek differential probe on VAUX6 |
 | `temp` | Zynq die temperature (°C) |
 | `pulse_count` | Cumulative pulse count |
 | `hv_enable` | Operator HV switch state |
@@ -282,7 +277,7 @@ python3 software/operator_console.py
 
 - **Connection**: enter board IP, click Connect.
 - **Parameters**: set Ton / Toff in µs, click **Apply** — sends values to FPGA and auto-sets `capture_len = Ton + Toff` (one complete pulse cycle per burst, max 1024).
-- **Pulse overlay**: shows the last N burst waveforms overlaid (CH1 gap voltage, CH2 arc current).  The **Show 1 in every N pulses** spinbox controls which pulses appear in the overlay (default: 1 in 1000).  Every pulse feeds the histogram regardless.
+- **Pulse overlay**: shows the last N burst waveforms overlaid (CH1 arc current, CH2 gap voltage).  The **Show 1 in every N pulses** spinbox controls which pulses appear in the overlay (default: 1 in 1000).  Every pulse feeds the histogram regardless.
 - **Histogram**: rolling 1-minute distribution of per-pulse mean gap voltage and arc current.
 - **Gap Voltage (DPH8909)**: set voltage and current limit, toggle output on/off.  Commands route over TCP to the board; the board drives the PSU directly via `/dev/ttyPS1` (Raspberry Pi header UART).  Measured V/I readback updates at 1 Hz.
 
@@ -363,6 +358,84 @@ pynq  numpy  pyserial
 - [x] Operator console — burst overlay, pulse decimation, rolling histogram, N-pulse running avg gap voltage
 - [x] DPH8909 gap voltage PSU — controlled from board UART via TCP commands
 - [x] Modbus TCP server — LinuxCNC HAL integration
+- [x] Sample FIFO in waveform_capture.v — eliminates dropped pair_ready events during DMA backpressure
 - [ ] Hardware bring-up and calibration (CH1 probe divider ratio, CH2 scaling)
 - [ ] Verify /dev/ttyPS1 available on board and DPH8909 communication
 - [ ] LinuxCNC HAL configuration and adaptive feed tuning
+
+---
+
+## Lessons Learned
+
+Hard-won debugging notes from bring-up on the PYNQ-Z2.
+
+### 1. Vivado `apply_bd_automation` silently overrides PS7 clock settings
+
+Setting `PCW_FPGA0_PERIPHERAL_FREQMHZ` on the PS7 block **before** calling `apply_bd_automation` is useless — the automation rule reconfigures the PLL and overwrites the frequency.  Our bitstream booted at 62.5 MHz instead of 100 MHz, causing pulse timing to be 1.6× too slow.
+
+**Fix:** Re-apply the FCLK setting **after** `apply_bd_automation`:
+```tcl
+apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 ...
+set_property CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {100.000000} [get_bd_cells ps7]
+```
+Even with this TCL fix, the bitstream still booted at 62.5 MHz in our case.  The reliable workaround is a runtime fix in Python:
+```python
+from pynq import Clocks
+if abs(Clocks.fclk0_mhz - 100.0) > 1.0:
+    Clocks.fclk0_mhz = 100.0
+```
+
+### 2. XADC channel naming: VAUX1 vs VAUX6
+
+The PYNQ-Z2 Arduino analog header **A0/A1** maps to **VAUX6** (pins K14/J14), not VAUX1.  The Vivado XADC Wizard property is `CHANNEL_ENABLE_VAUXP6_VAUXN6`.  Using the wrong channel silently produces zero readings with no synthesis or implementation errors — the XADC simply samples an unconnected channel.
+
+### 3. XADC clears result registers at the START of conversion, not the end
+
+Reading a channel's DRP result register while that channel is being converted returns zero.  In simultaneous sampling mode, VP/VN and VAUX6 conversions overlap in time.  Reading address `0x03` during a VAUX6 EOC (while VP/VN is mid-conversion) returns zero on every other sample.
+
+**Fix:** Only read each register when `channel_out` confirms that specific channel just finished converting.  This guarantees the result register is valid.
+
+### 4. DMA backpressure drops single-cycle pulses — use a FIFO
+
+`pair_ready` from the XADC DRP reader is a single-cycle pulse at ~500 kHz (~200 clock cycles apart).  The AXI DMA deasserts `tready` during DDR burst writes (~16 beats).  If the capture FSM is waiting for `tready` when `pair_ready` fires, the sample is permanently lost.
+
+Symptoms: pulse edges appeared at random positions in the capture buffer; the first few samples captured fine (DMA internal FIFO had room), then samples dropped during the first DDR burst write.
+
+**Fix:** A 32-deep synchronous FIFO between the XADC reader and the AXI-Stream output FSM.  The FIFO absorbs DMA burst pauses completely — at 200 clocks between samples, even short FIFOs work.
+
+### 5. Zynq HP0 port drops every other 32-bit write
+
+Even when `PCW_S_AXI_HP0_DATA_WIDTH` is set to 32, the HP0 port internally operates at 64-bit width and drops (or aliases) odd-addressed 32-bit writes.
+
+**Workaround:** Output each sample **twice** on the AXI4-Stream.  The DMA receives 2N words; HP0 commits only even-addressed ones.  Software reads the buffer at stride 2: `words[::2]`.  DMA transfer length is `capture_len * 8` (×2 for dual-beat, ×4 for 32-bit word size, but HP0 64-bit stride means ×8 total).
+
+### 6. Changing `capture_len` mid-capture causes DMA hang
+
+If the AXI register `capture_len` is changed while a waveform capture is in progress, the FIFO fill count and the output FSM's sample counter disagree on how many samples to expect.  The FSM waits forever for samples that will never arrive, and the DMA never sees TLAST.
+
+**Fix:** Latch `capture_len` into a local register at trigger time.  The latched value is used for both the FIFO fill limit and the output sample count — immune to register changes during capture.
+
+### 7. PYNQ-Z2 VP/VN has a 140 Ohm + 1 nF RC filter; A0–A5 do not
+
+The dedicated VP/VN differential input on the PYNQ-Z2 has a 140 Ohm series resistor and 1 nF differential capacitor on the board (visible in the schematic, confirmed in the user manual).  This creates a low-pass filter with tau ~ 140 ns, which severely attenuates fast edges (10 µs pulse rise/fall becomes a slow exponential ramp taking ~20 samples at 500 kSPS).
+
+The Arduino analog inputs A0–A5 (VAUX channels) do **not** have this RC filter — they have only a series resistor with no capacitor, giving much faster response.
+
+**Implication:** Route the fast-changing signal (gap voltage via differential probe) to A0/VAUX6, and the slower signal (current sense) to VP/VN.
+
+### 8. PYNQ overlay load crashes the SSH session
+
+Loading a PYNQ overlay (`Overlay("edm_pynq.bit")`) on the PYNQ-Z2 reliably kills the SSH session that runs it — the PL reconfiguration disrupts the PS network stack momentarily.
+
+**Workaround:** Use a bash script with `nohup`/`disown`:
+```bash
+#!/bin/bash
+export XILINX_XRT=/usr
+nohup python3 -u xadc_server.py > xadc_server.log 2>&1 &
+disown
+```
+Run via SSH (`sudo bash /tmp/restart_edm.sh`).  The SSH session drops, but the Python process survives.  Check the log from a new SSH session after ~5 seconds.
+
+### 9. `XILINX_XRT=/usr` is required for PYNQ overlay loading
+
+Without `export XILINX_XRT=/usr`, the PYNQ overlay loader fails with cryptic errors.  This environment variable is set in the board's default login profile but is lost when running via `sudo` or `nohup` from a script.  Always export it explicitly in wrapper scripts.
