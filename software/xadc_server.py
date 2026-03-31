@@ -188,6 +188,59 @@ class EdmServer:
             elapsed = time.time() - t0
             time.sleep(max(0, interval - elapsed))
 
+    # ── High-rate gap voltage polling (per-pulse batch) ───
+
+    def _gap_poll_loop(self):
+        """Read PL gap accumulator at 100 Hz, compute running stats.
+        Sends gap_batch (individual values for histogram) every second,
+        and gap_stats (avg + std) at 10 Hz for real-time display."""
+        last_pc = self._edm.read(REG_PULSE_COUNT)
+        batch = []
+        last_batch_tx = time.time()
+        last_stats_tx = time.time()
+        interval = 1.0 / 100   # 100 Hz poll
+
+        while self._running:
+            t0 = time.time()
+            try:
+                pc = self._edm.read(REG_PULSE_COUNT)
+                if pc != last_pc:
+                    last_pc = pc
+                    gap_sum = self._edm.read(REG_GAP_SUM)
+                    gap_count = self._edm.read(REG_GAP_COUNT) & 0xFFFF
+                    if gap_count > 0:
+                        avg = round(gap_sum / gap_count / 4096 * CH2_RANGE, 2)
+                        batch.append(avg)
+
+                now = time.time()
+
+                # Send stats at 10 Hz
+                if now - last_stats_tx >= 0.1 and len(batch) >= 2:
+                    arr = np.array(batch[-100:], dtype=np.float32)  # last 100 readings
+                    frame = json.dumps({
+                        'type': 'gap_stats',
+                        'avg': round(float(arr.mean()), 2),
+                        'std': round(float(arr.std()), 3),
+                        'n': len(arr),
+                    }).encode() + b'\n'
+                    self._broadcast(frame)
+                    last_stats_tx = now
+
+                # Send batch for histogram every second
+                if now - last_batch_tx >= 1.0 and batch:
+                    frame = json.dumps({
+                        'type': 'gap_batch',
+                        'values': batch,
+                    }).encode() + b'\n'
+                    self._broadcast(frame)
+                    batch = []
+                    last_batch_tx = now
+
+            except Exception as e:
+                print(f"Gap poll error: {e}")
+            elapsed = time.time() - t0
+            time.sleep(max(0, interval - elapsed))
+
     # ── Waveform capture via AXI-Lite BRAM readout ───────
 
     def _capture_loop(self):
@@ -299,6 +352,7 @@ class EdmServer:
     def run(self):
         threading.Thread(target=self._status_loop, daemon=True).start()
         threading.Thread(target=self._capture_loop, daemon=True).start()
+        threading.Thread(target=self._gap_poll_loop, daemon=True).start()
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(('0.0.0.0', TCP_PORT)); srv.listen(4)

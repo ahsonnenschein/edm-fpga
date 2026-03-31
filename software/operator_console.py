@@ -43,6 +43,8 @@ HIST_BUF_MAX    = 12_000    # 1 min at 200 Hz
 class WorkerSignals(QObject):
     sample_ready  = Signal(float, float, float)   # ch1, ch2, ts  (status frame)
     burst_ready   = Signal(object, object, object)  # ch1_list, ch2_list, pulse_list (burst frame)
+    gap_batch     = Signal(object)                   # list of per-pulse gap averages
+    gap_stats     = Signal(float, float, int)        # avg, std, n
     status_update = Signal(dict)
     connection_ok = Signal(bool)
     error         = Signal(str)
@@ -107,6 +109,11 @@ class PollWorker:
                                     d.get('ch2', []),
                                     d.get('pulse', []),
                                 )
+                            elif d.get('type') == 'gap_batch':
+                                self.signals.gap_batch.emit(d.get('values', []))
+                            elif d.get('type') == 'gap_stats':
+                                self.signals.gap_stats.emit(
+                                    d.get('avg', 0), d.get('std', 0), d.get('n', 0))
                             else:
                                 self.signals.sample_ready.emit(
                                     d.get('ch1', 0.0),
@@ -464,6 +471,12 @@ class HistogramWidget(QWidget):
             self._buf_gap.append(gap_avg)
             self._last_pc = pc
 
+    def add_gap_batch(self, values):
+        """Called ~1/sec with batch of per-pulse gap averages from PL."""
+        for v in values:
+            if v > 0:
+                self._buf_gap.append(v)
+
     def add_burst(self, ch1_arr: np.ndarray, ch2_arr: np.ndarray):
         """Add per-pulse current from burst waveform."""
         if len(ch1_arr):
@@ -515,6 +528,8 @@ class OperatorConsole(QMainWindow):
 
         self._signals.sample_ready.connect(self._on_sample)
         self._signals.burst_ready.connect(self._on_burst)
+        self._signals.gap_batch.connect(self._on_gap_batch)
+        self._signals.gap_stats.connect(self._on_gap_stats)
         self._signals.status_update.connect(self._on_status)
         self._signals.connection_ok.connect(self._on_connection)
         self._signals.error.connect(self._on_error)
@@ -577,15 +592,17 @@ class OperatorConsole(QMainWindow):
         # Status
         sbox = QGroupBox("Status")
         sf   = QFormLayout(sbox)
-        self._lbl_conn   = QLabel("Disconnected")
+        self._lbl_conn    = QLabel("Disconnected")
         self._lbl_conn.setStyleSheet("color: gray;")
-        self._lbl_pulse  = QLabel("—")
-        self._lbl_hven   = QLabel("—")
-        self._lbl_enable = QLabel("—")
+        self._lbl_pulse   = QLabel("—")
+        self._lbl_hven    = QLabel("—")
+        self._lbl_enable  = QLabel("—")
+        self._lbl_gap_avg = QLabel("—")
         sf.addRow("Link:",        self._lbl_conn)
         sf.addRow("Pulse count:", self._lbl_pulse)
         sf.addRow("HV switch:",   self._lbl_hven)
         sf.addRow("Sparks:",      self._lbl_enable)
+        sf.addRow("Gap avg:",     self._lbl_gap_avg)
         left.addWidget(sbox)
 
         # Power supply — serial on PYNQ RPi header, commands via TCP
@@ -731,6 +748,14 @@ class OperatorConsole(QMainWindow):
         if self._burst_rx_count % decimation == 0:
             self._wave_widget.add_burst(ch1_list, ch2_list, pulse_list)
         self._hist_widget.add_burst(ch1_arr, ch2_arr)
+
+    def _on_gap_batch(self, values):
+        self._hist_widget.add_gap_batch(values)
+
+    def _on_gap_stats(self, avg, std, n):
+        self._lbl_gap_avg = getattr(self, '_lbl_gap_avg', None)
+        if self._lbl_gap_avg:
+            self._lbl_gap_avg.setText(f"{avg:.1f} V ± {std:.2f}  (n={n})")
 
     def _on_status(self, d: dict):
         self._last_status = d
