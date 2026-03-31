@@ -501,3 +501,29 @@ input wire S_AXI_ACLK,
 output wire [31:0] m_axis_tdata,
 ```
 This tells Vivado at the HDL level which bus interfaces share which clock, eliminating the warning and ensuring proper timing constraints.
+
+### 18. Never qualify trigger acceptance on `m_axis_tready` — decouple capture from DMA
+
+The original `waveform_capture.v` started capture only when `trig_rise && m_axis_tready`.  This couples the capture start to DMA readiness, meaning the capture begins on "the first trigger where tready happens to be HIGH" — which is a random trigger relative to when software armed the DMA.  This produced a uniform first-period distribution with a range of exactly Toff in samples.
+
+**Fix:** Decouple trigger detection from DMA streaming:
+1. `trig_rise` alone starts capture into a local BRAM buffer (no tready check)
+2. After `capture_len` samples are stored, assert `frame_ready`
+3. Only then begin AXI-Stream output to DMA
+4. Add a software-visible `arm_capture` one-shot register so only the intended trigger fires
+
+This also fixes PYNQ DMA compatibility — PYNQ's driver holds the DMA in reset until `transfer()` is called, so `tready` is never HIGH for raw MMIO.  With a decoupled architecture, `tready` timing is irrelevant to capture start.
+
+### 19. `PCW_USE_FABRIC_INTERRUPT` cannot be set via TCL `set_property` — use GUI
+
+Setting `CONFIG.PCW_USE_FABRIC_INTERRUPT {1}` on the PS7 via TCL appears to succeed (the property reads back as 1), but the PS7 IP does not regenerate its `IRQ_F2P` port.  `validate_bd_design` and `save_bd_design` do not help.  The HWH always shows `PCW_USE_FABRIC_INTERRUPT = 0` and the IRQ pin is absent from the synthesized netlist.
+
+**Fix:** Open the block design in the Vivado GUI, double-click the PS7, navigate to Interrupts → Fabric Interrupts → enable `IRQ_F2P[15:0]`, click OK.  This is the only reliable way to enable fabric interrupts on the Zynq PS7 IP.
+
+### 20. PYNQ Overlay auto-detects AXI DMA and blocks raw MMIO
+
+When `Overlay()` parses the HWH and finds an IP with `VLNV=xilinx.com:ip:axi_dma:*`, it installs the `pynq.lib.dma.DMA` driver which takes exclusive ownership of the DMA registers via UIO.  Raw MMIO writes (via PYNQ MMIO or `/dev/mem`) to the DMA control register are silently ignored — DMACR reads back 0x00010006 (Reset stuck, RS=0) regardless of what is written.
+
+Hiding the DMA by modifying MODTYPE/VLNV in the HWH does not fully work — the DMA registers still show the stuck value after an overlay load.  The only reliable approaches are:
+- Use PYNQ's DMA API (`dma.recvchannel.transfer()` / `.wait()`) with interrupts properly connected
+- Or decouple capture from DMA entirely (see lesson #18)
