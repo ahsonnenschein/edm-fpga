@@ -524,6 +524,12 @@ Setting `CONFIG.PCW_USE_FABRIC_INTERRUPT {1}` on the PS7 via TCL appears to succ
 
 When `Overlay()` parses the HWH and finds an IP with `VLNV=xilinx.com:ip:axi_dma:*`, it installs the `pynq.lib.dma.DMA` driver which takes exclusive ownership of the DMA registers via UIO.  Raw MMIO writes (via PYNQ MMIO or `/dev/mem`) to the DMA control register are silently ignored — DMACR reads back 0x00010006 (Reset stuck, RS=0) regardless of what is written.
 
-Hiding the DMA by modifying MODTYPE/VLNV in the HWH does not fully work — the DMA registers still show the stuck value after an overlay load.  The only reliable approaches are:
-- Use PYNQ's DMA API (`dma.recvchannel.transfer()` / `.wait()`) with interrupts properly connected
-- Or decouple capture from DMA entirely (see lesson #18)
+Additionally, accessing PYNQ's DMA object (`ol.axi_dma_0`) can **crash the Python process** (segfault/bus error) if the DMA's UIO device isn't properly set up.  Writing to the DMA control register through PYNQ's internal MMIO (`rc._mmio.write(rc._offset, ...)`) can crash the **entire board** (kernel panic from UIO interrupt handler).
+
+**Working approach:** Modify the HWH to rename the DMA's `MODTYPE` and `VLNV` so PYNQ treats it as `DefaultIP` (no DMA driver installed).  Then use raw `/dev/mem` mmap for DMA register access with polling-based completion detection via `waveform_count`.  Combine with the decoupled BRAM capture architecture (lesson #18) so DMA timing doesn't affect capture alignment.
+
+### 21. PYNQ overlay reload crashes the FPGA manager
+
+Loading an overlay a second time on the same boot session often leaves the FPGA manager in a `write init error` state.  Subsequent `Overlay()` calls fail with `OSError: [Errno 16] Device or resource busy`.  The only recovery is a power cycle.
+
+**Workaround:** Design the server to load the overlay once at startup and never reload.  If the server crashes, power-cycle the board before restarting.  Do not use `killall python3 && restart` — kill the server and restart WITHOUT reloading the overlay (use `download=False` if the bitstream is already loaded).

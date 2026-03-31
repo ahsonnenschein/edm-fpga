@@ -186,28 +186,14 @@ class EdmServer:
         self._clients = []
         self._running = True
 
-        # Load overlay using a MODIFIED HWH that hides the DMA IP from PYNQ.
-        # PYNQ's DMA driver claims exclusive ownership via UIO, blocking raw
-        # MMIO access.  By renaming the MODTYPE in the HWH, PYNQ loads the
-        # bitstream but treats the DMA as an unknown IP (DefaultIP), leaving
-        # the registers accessible via raw MMIO for polling-based control.
-        import shutil
-        _hwh_mod = OVERLAY_BIT.replace('.bit', '_nodma.hwh')
-        _hwh_orig = OVERLAY_BIT.replace('.bit', '.hwh')
-        if os.path.exists(_hwh_mod):
-            # Use the modified HWH — temporarily swap it in
-            _hwh_bak = _hwh_orig + '.bak'
-            shutil.copy(_hwh_orig, _hwh_bak)
-            shutil.copy(_hwh_mod, _hwh_orig)
-            print(f"Loading overlay: {OVERLAY_BIT} (DMA hidden from PYNQ)")
-            try:
-                Overlay(OVERLAY_BIT)
-            finally:
-                shutil.copy(_hwh_bak, _hwh_orig)
-                os.remove(_hwh_bak)
-        else:
-            print(f"Loading overlay: {OVERLAY_BIT}")
-            Overlay(OVERLAY_BIT)
+        # Load overlay with PYNQ DMA API.  Rev 10 decoupled architecture
+        # captures into BRAM first (trigger-independent), then streams to DMA.
+        # PYNQ's DMA driver timing doesn't affect capture alignment.
+        # Load overlay with MODIFIED HWH (DMA type renamed so PYNQ doesn't
+        # install its DMA driver, which crashes on access and blocks raw MMIO).
+        # The DMA is controlled via raw /dev/mem MMIO with polling.
+        print(f"Loading overlay: {OVERLAY_BIT}")
+        Overlay(OVERLAY_BIT)
         time.sleep(1)
         print("Overlay loaded.")
 
@@ -221,21 +207,28 @@ class EdmServer:
             print(f"FCLK_CLK0 = {actual:.1f} MHz (OK)")
 
         self._edm = MMIO(EDM_BASE, 0x28)
-        self._dma = MMIO(DMA_BASE, 0x100)
+
+        # DMA via raw /dev/mem (PYNQ driver disabled by HWH modification)
+        import mmap as _mmap
+        import struct as _struct
+        self._devmem_fd = open("/dev/mem", "r+b")
+        self._dma_mem = _mmap.mmap(self._devmem_fd.fileno(), 0x100,
+                                   offset=DMA_BASE, access=_mmap.ACCESS_WRITE)
+        self._struct = _struct
 
         self._buf = allocate(shape=(MAX_CAPTURE * 2,), dtype=np.uint32)
         self._buf_phys = self._buf.physical_address
-        print(f"DMA buffer: phys=0x{self._buf_phys:08X}, {MAX_CAPTURE} words")
+        print(f"DMA buffer: phys=0x{self._buf_phys:08X}")
 
         self._edm.write(REG_CAPTURE_LEN, 100)
         print("Capture length set to 100 samples")
 
-        # Reset and start DMA engine
-        self._dma.write(DMA_S2MM_CONTROL, 0x0004)
+        # Reset and start DMA
+        self._dma_write(DMA_S2MM_CONTROL, 0x0004)
         time.sleep(0.01)
-        self._dma.write(DMA_S2MM_CONTROL, 0x0001)
-        st = self._dma.read(DMA_S2MM_STATUS)
-        print(f"DMA initialized: status=0x{st:04X}")
+        self._dma_write(DMA_S2MM_CONTROL, 0x0001)
+        st = self._dma_read(DMA_S2MM_STATUS)
+        print(f"DMA init: DMACR=0x{self._dma_read(DMA_S2MM_CONTROL):08X} DMASR=0x{st:08X}")
 
         # PSU on Pmod B UART (MMIO access to PS UART1)
         self._psu      = None
@@ -309,19 +302,26 @@ class EdmServer:
             elapsed = time.time() - t0
             time.sleep(max(0, interval - elapsed))
 
+    def _dma_write(self, offset, value):
+        self._dma_mem.seek(offset)
+        self._dma_mem.write(self._struct.pack("<I", value & 0xFFFFFFFF))
+
+    def _dma_read(self, offset):
+        self._dma_mem.seek(offset)
+        return self._struct.unpack("<I", self._dma_mem.read(4))[0]
+
     # ── Per-pulse DMA waveform capture ────────────────────────────────────────
 
     _DMA_HALTED  = 0x0001
     _DMA_IDLE    = 0x0002
-    _DMA_DMAERR  = 0x0010
-    _DMA_SLVERR  = 0x0020
-    _DMA_DECERR  = 0x0040
     _DMA_IOC_IRQ = 0x1000
 
     def _dma_loop(self):
         """
-        Uses PYNQ DMA driver's transfer() to arm the DMA, then polls
-        the recvchannel's idle property for completion (no interrupt needed).
+        Rev 10 decoupled capture: BRAM fills on trigger (no tready needed),
+        then streams to DMA.  Uses raw /dev/mem MMIO for DMA control
+        (PYNQ DMA driver disabled via HWH modification).
+        Polls waveform_count for completion detection.
         """
         last_wf_count = self._edm.read(REG_WAVEFORM_CNT)
         _last_tx   = 0.0
@@ -332,56 +332,53 @@ class EdmServer:
                 capture_len = max(1, min(
                     self._edm.read(REG_CAPTURE_LEN) & 0xFFFF, MAX_CAPTURE
                 ))
-                if False:  # buffer reallocation not needed for raw MMIO mode
-                    pass
-                    self._buf = allocate(shape=(capture_len * 2,), dtype=np.uint32)
-                    print(f"DMA buffer reallocated: {capture_len} samples, {len(self._buf)*4} bytes")
 
-                # Arm DMA via raw MMIO (PYNQ driver hidden)
-                st_before = self._dma.read(DMA_S2MM_STATUS)
-                if st_before & self._DMA_HALTED:
-                    self._dma.write(DMA_S2MM_CONTROL, 0x0004)
+                # Arm DMA via raw MMIO
+                st = self._dma_read(DMA_S2MM_STATUS)
+                if st & self._DMA_HALTED:
+                    self._dma_write(DMA_S2MM_CONTROL, 0x0004)
                     time.sleep(0.002)
-                    self._dma.write(DMA_S2MM_CONTROL, 0x0001)
+                    self._dma_write(DMA_S2MM_CONTROL, 0x0001)
                     time.sleep(0.001)
-                self._dma.write(DMA_S2MM_STATUS, 0x7000)
-                self._dma.write(DMA_S2MM_DST_ADDR, self._buf_phys & 0xFFFFFFFF)
-                self._dma.write(DMA_S2MM_LENGTH, capture_len * 8)
+                self._dma_write(DMA_S2MM_STATUS, 0x7000)
+                self._dma_write(DMA_S2MM_DST_ADDR, self._buf_phys & 0xFFFFFFFF)
+                self._dma_write(DMA_S2MM_LENGTH, capture_len * 8)
 
-                if _dbg_ok == 0 and (_dbg_iter := getattr(self, '_dbg_iter', 0) + 1) <= 5:
-                    self._dbg_iter = _dbg_iter
-                    st_after = self._dma.read(DMA_S2MM_STATUS)
-                    print(f"DMA arm #{_dbg_iter}: before=0x{st_before:04X} after=0x{st_after:04X} cap={capture_len}")
-
-                # Poll for completion, max 5s
+                # Poll waveform_count for completion (not DMA interrupt).
+                # waveform_count increments when the stream phase finishes
+                # (after TLAST), so when it changes, the buffer is ready.
                 deadline = time.time() + 5.0
                 done = False
                 while time.time() < deadline:
-                    st = self._dma.read(DMA_S2MM_STATUS)
-                    if st & (self._DMA_IDLE | self._DMA_IOC_IRQ):
+                    wf_count = self._edm.read(REG_WAVEFORM_CNT)
+                    if wf_count != last_wf_count:
                         done = True
                         break
-                    if st & (self._DMA_DMAERR | self._DMA_SLVERR | self._DMA_DECERR):
-                        print(f"DMA error: status=0x{st:04X}")
-                        break
-                    time.sleep(0.0001)
+                    time.sleep(0.0002)
 
                 if not done:
-                    self._dma.write(DMA_S2MM_CONTROL, 0x0004)
-                    time.sleep(0.01)
-                    self._dma.write(DMA_S2MM_CONTROL, 0x0001)
+                    if _dbg_ok == 0:
+                        print(f"DMA: waveform_count stuck at {last_wf_count}")
+                    # Reset the PYNQ DMA channel for next attempt
+                    try:
+                        self._pynq_dma.recvchannel._mmio.write(
+                            self._pynq_dma.recvchannel._offset, 0x0004)
+                        time.sleep(0.01)
+                        self._pynq_dma.recvchannel._mmio.write(
+                            self._pynq_dma.recvchannel._offset, 0x10001)
+                    except Exception:
+                        pass
                     continue
 
-                wf_count = self._edm.read(REG_WAVEFORM_CNT)
-                if wf_count == last_wf_count:
-                    continue
                 _dbg_ok += 1
                 last_wf_count = wf_count
 
                 if _dbg_ok <= 5 or _dbg_ok % 500 == 0:
                     print(f"DMA capture #{_dbg_ok}: wf_count={wf_count} cap={capture_len}")
 
-                # Parse buffer
+                # Parse buffer: {ch1[11:0], 4'b0, ch2[11:0], 3'b0, pulse_state}
+                # HP0 writes at 64-bit stride — valid data at even uint32 indices.
+                self._buf.invalidate()
                 words = np.array(self._buf[:capture_len * 2:2], dtype=np.uint32)
                 ch1_raw = ((words >> 20) & 0xFFF).astype(np.float32)
                 ch2_raw = ((words >> 4) & 0xFFF).astype(np.float32)
