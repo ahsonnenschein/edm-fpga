@@ -153,7 +153,7 @@ class WaveformWidget(QWidget):
         self._prescale = 1
         self._ton_us   = 10
         self._toff_us  = 90
-        self._burst_history = deque(maxlen=20)   # last 20 bursts overlaid
+        self._burst_history = deque(maxlen=50)   # last 50 bursts overlaid
 
         self.fig = Figure(figsize=(7, 4), tight_layout=True)
         self.fig.patch.set_facecolor('#1e1e1e')
