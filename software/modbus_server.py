@@ -18,8 +18,9 @@ Modbus input registers (16-bit, read-only, FC4):
   0: Pulse_count_lo   Lower 16 bits of running pulse count
   1: Pulse_count_hi   Upper 16 bits of running pulse count
   2: HV_enable        Operator HV enable switch state (0 or 1)
-  3: Gap_voltage_avg  Smoothed gap voltage, 0-4095 (XADC CH1)
+  3: Gap_voltage_avg  Per-pulse gap voltage avg (0-4095 raw ADC, from PL)
   4: Arc_ok           1 = gap voltage in normal arc range, 0 = short or open
+  5: AF1_x1000        Adaptive feed parameter = (Vset-Vavg)/Vavg × 1000 (signed)
 
 Run as root on the board:
     sudo XILINX_XRT=/usr /usr/local/share/pynq-venv/bin/python3 modbus_server.py
@@ -41,10 +42,8 @@ REG_ENABLE      = 0x08
 REG_PULSE_COUNT = 0x0C
 REG_HV_ENABLE   = 0x10
 REG_XADC_CH1    = 0x1C
-
-# Smoothing
-ALPHA        = 0.05
-XADC_POLL_HZ = 500
+REG_GAP_SUM     = 0x28
+REG_GAP_COUNT   = 0x2C
 
 
 class EdmHardware:
@@ -54,12 +53,6 @@ class EdmHardware:
         self._fd  = open("/dev/mem", "r+b")
         self._mem = mmap.mmap(self._fd.fileno(), EDM_SIZE,
                               offset=EDM_BASE, access=mmap.ACCESS_WRITE)
-        self._gap_avg = 0.0
-        self._gap_lock = threading.Lock()
-
-        # Start gap voltage polling thread
-        t = threading.Thread(target=self._poll_gap, daemon=True)
-        t.start()
 
     def write(self, offset, value):
         self._mem.seek(offset)
@@ -69,23 +62,14 @@ class EdmHardware:
         self._mem.seek(offset)
         return struct.unpack("<I", self._mem.read(4))[0]
 
-    def _poll_gap(self):
-        interval = 1.0 / XADC_POLL_HZ
-        while True:
-            t0 = time.monotonic()
-            try:
-                raw = self.read(REG_XADC_CH1) & 0xFFF
-                with self._gap_lock:
-                    self._gap_avg += ALPHA * (raw - self._gap_avg)
-            except Exception:
-                pass
-            elapsed = time.monotonic() - t0
-            time.sleep(max(0, interval - elapsed))
-
     @property
     def gap_voltage_avg(self):
-        with self._gap_lock:
-            return int(round(self._gap_avg))
+        """Per-pulse gap voltage average from PL accumulator (raw 12-bit)."""
+        gap_sum = self.read(REG_GAP_SUM)
+        gap_count = self.read(REG_GAP_COUNT) & 0xFFFF
+        if gap_count > 0:
+            return int(round(gap_sum / gap_count))
+        return 0
 
 
 # Holding register defaults and thresholds (stored in Python, not on FPGA)
@@ -141,18 +125,25 @@ def main():
             if fc in (3, 6, 16):  # holding registers
                 return 0 <= address < 6 and address + count <= 6
             if fc == 4:           # input registers
-                return 0 <= address < 5 and address + count <= 5
+                return 0 <= address < 6 and address + count <= 6
             return False
 
         def getValues(self, fc, address, count=1):
             if fc == 4:  # input registers
                 pc = hw.read(REG_PULSE_COUNT)
                 hv = hw.read(REG_HV_ENABLE) & 1
-                gap = hw.gap_voltage_avg
+                gap_raw = hw.gap_voltage_avg  # raw 12-bit ADC average
                 short_t = hr_values.get(4, 200)
                 open_t = hr_values.get(5, 3500)
-                arc_ok = 1 if (short_t < gap < open_t) else 0
-                ir_data = [pc & 0xFFFF, (pc >> 16) & 0xFFFF, hv, gap, arc_ok]
+                arc_ok = 1 if (short_t < gap_raw < open_t) else 0
+                # AF1 = (Vset - Vavg) / Vavg, scaled ×1000 as signed 16-bit
+                gap_setpoint = hr_values.get(3, 2048)
+                if gap_raw > 10:
+                    af1_raw = int(round((gap_setpoint - gap_raw) / gap_raw * 1000))
+                    af1_u16 = af1_raw & 0xFFFF  # signed → unsigned 16-bit
+                else:
+                    af1_u16 = 0
+                ir_data = [pc & 0xFFFF, (pc >> 16) & 0xFFFF, hv, gap_raw, arc_ok, af1_u16]
                 return ir_data[address:address + count]
             if fc in (3,):  # holding registers
                 vals = list(hr_values.values())

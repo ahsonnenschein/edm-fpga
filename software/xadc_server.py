@@ -216,11 +216,15 @@ class EdmServer:
 
                 # Send stats at 10 Hz
                 if now - last_stats_tx >= 0.1 and len(batch) >= 2:
-                    arr = np.array(batch[-100:], dtype=np.float32)  # last 100 readings
+                    arr = np.array(batch[-100:], dtype=np.float32)
+                    avg = float(arr.mean())
+                    std = float(arr.std())
+                    # Store latest avg for Modbus/AF1 access
+                    self._gap_avg_latest = avg
                     frame = json.dumps({
                         'type': 'gap_stats',
-                        'avg': round(float(arr.mean()), 2),
-                        'std': round(float(arr.std()), 3),
+                        'avg': round(avg, 2),
+                        'std': round(std, 3),
                         'n': len(arr),
                     }).encode() + b'\n'
                     self._broadcast(frame)

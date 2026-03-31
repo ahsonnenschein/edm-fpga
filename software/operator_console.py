@@ -603,6 +603,17 @@ class OperatorConsole(QMainWindow):
         sf.addRow("HV switch:",   self._lbl_hven)
         sf.addRow("Sparks:",      self._lbl_enable)
         sf.addRow("Gap avg:",     self._lbl_gap_avg)
+
+        # Adaptive feed control
+        self._vset_spin = QDoubleSpinBox()
+        self._vset_spin.setRange(0.0, 100.0)
+        self._vset_spin.setDecimals(1)
+        self._vset_spin.setSingleStep(1.0)
+        self._vset_spin.setValue(20.0)
+        self._vset_spin.setSuffix(" V")
+        self._lbl_af1 = QLabel("—")
+        sf.addRow("Gap setpoint:", self._vset_spin)
+        sf.addRow("AF1:",          self._lbl_af1)
         left.addWidget(sbox)
 
         # Power supply — serial on PYNQ RPi header, commands via TCP
@@ -753,9 +764,23 @@ class OperatorConsole(QMainWindow):
         self._hist_widget.add_gap_batch(values)
 
     def _on_gap_stats(self, avg, std, n):
-        self._lbl_gap_avg = getattr(self, '_lbl_gap_avg', None)
         if self._lbl_gap_avg:
             self._lbl_gap_avg.setText(f"{avg:.1f} V ± {std:.2f}  (n={n})")
+        # AF1 = (Vset - Vavg) / Vavg
+        vset = self._vset_spin.value()
+        if avg > 0.1:
+            af1 = (vset - avg) / avg
+            self._lbl_af1.setText(f"{af1:+.3f}")
+            # Color: green=on target, red=off target
+            if abs(af1) < 0.1:
+                self._lbl_af1.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            elif abs(af1) < 0.3:
+                self._lbl_af1.setStyleSheet("color: #FF9800; font-weight: bold;")
+            else:
+                self._lbl_af1.setStyleSheet("color: #F44336; font-weight: bold;")
+        else:
+            self._lbl_af1.setText("—")
+            self._lbl_af1.setStyleSheet("")
 
     def _on_status(self, d: dict):
         self._last_status = d
