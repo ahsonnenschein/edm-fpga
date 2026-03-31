@@ -193,12 +193,7 @@ class EdmServer:
 
         while self._running:
             try:
-                cap = max(1, min(self._edm.read(REG_CAPTURE_LEN) & 0xFFFF, MAX_CAPTURE))
-                if cap != self._capture_len:
-                    self._capture_len = cap
-                    self._buf = allocate(shape=(cap * 2,), dtype=np.uint32)
-
-                # Arm DMA via PYNQ
+                # Arm DMA via PYNQ (buffer must match capture_len exactly)
                 self._dma.recvchannel.transfer(self._buf)
 
                 # Poll waveform_count for completion
