@@ -551,3 +551,15 @@ Writing RS=1 to S2MM_DMACR before setting the destination address and buffer len
 4. Set RS=1 (write 0x0001 to DMACR) — LAST
 
 This only matters for raw MMIO access.  PYNQ's DMA API handles the order correctly.
+
+### 24. Eliminate AXI DMA — use AXI-Lite BRAM readout instead
+
+The AXI DMA on PYNQ-Z2 is unreliable due to PYNQ driver conflicts, tready coupling, interrupt requirements, and FPGA manager issues.  After two days of debugging, the solution was to **eliminate the DMA entirely**.
+
+Rev 11 stores waveform samples in local BRAM inside `waveform_capture.v`, then software reads them via the AXI-Lite register file at offsets 0x800–0xFFC (up to 512 samples).  This is slower than DMA (~400µs per 100-sample readout vs ~10µs for DMA) but 100% reliable with no driver conflicts.
+
+This also fixed the first-period anomaly: with the trigger decoupled from `m_axis_tready`, every capture starts at exactly the right pulse edge (std=0.3 vs 14 before).
+
+### 25. XADC VP/VN requires both pins connected — VN must not float
+
+The XADC VP/VN differential input measures (VP − VN).  If VN is left floating, the measurement has a large DC offset (~9V with 50x probe scaling) that makes the signal appear inverted.  Connect VN to the **XADC header GND pin** (pin 3) or to the signal source ground for a proper differential reference.
