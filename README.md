@@ -532,4 +532,22 @@ Additionally, accessing PYNQ's DMA object (`ol.axi_dma_0`) can **crash the Pytho
 
 Loading an overlay a second time on the same boot session often leaves the FPGA manager in a `write init error` state.  Subsequent `Overlay()` calls fail with `OSError: [Errno 16] Device or resource busy`.  The only recovery is a power cycle.
 
-**Workaround:** Design the server to load the overlay once at startup and never reload.  If the server crashes, power-cycle the board before restarting.  Do not use `killall python3 && restart` — kill the server and restart WITHOUT reloading the overlay (use `download=False` if the bitstream is already loaded).
+**Workaround:** Design the server to load the overlay once at startup and never reload.  If the server crashes, power-cycle the board before restarting.
+
+### 22. PYNQ DMA requires proper HWH — modified HWH breaks DMA access
+
+Modifying the HWH to hide the DMA (changing MODTYPE/VLNV) does NOT prevent PYNQ from blocking DMA register access.  Even with the modified HWH, DMACR reads 0x00010006 (Reset stuck) and raw MMIO writes are ignored.
+
+The ONLY working approach is to use PYNQ's DMA API (`dma.recvchannel.transfer()`) with the REAL HWH.  Poll `waveform_count` via EDM MMIO for completion detection instead of `dma.recvchannel.wait()` (which requires interrupts).
+
+The first `transfer()` after boot may time out — the DMA channel needs one failed cycle to initialize.  Subsequent transfers work.  Handle the first "DMA channel not idle" errors gracefully.
+
+### 23. DMA arm order: address and length BEFORE RS=1
+
+Writing RS=1 to S2MM_DMACR before setting the destination address and buffer length causes `tready` to drop after 4 beats.  The correct sequence is:
+1. Reset (write 0x0004 to DMACR)
+2. Write destination address (offset 0x48)
+3. Write buffer length (offset 0x58)
+4. Set RS=1 (write 0x0001 to DMACR) — LAST
+
+This only matters for raw MMIO access.  PYNQ's DMA API handles the order correctly.

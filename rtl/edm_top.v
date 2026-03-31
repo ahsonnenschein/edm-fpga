@@ -12,7 +12,6 @@ module edm_top #(
     parameter C_S_AXI_ADDR_WIDTH = 6
 )(
     // AXI4-Lite slave
-    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF S_AXI:M_AXIS, ASSOCIATED_RESET S_AXI_ARESETN" *)
     input  wire                             S_AXI_ACLK,
     input  wire                             S_AXI_ARESETN,
     input  wire [C_S_AXI_ADDR_WIDTH-1:0]   S_AXI_AWADDR,
@@ -58,13 +57,9 @@ module edm_top #(
     output wire        xadc_den,      // den_in: DRP read enable
 
     // AXI4-Stream master to AXI DMA S_AXIS_S2MM
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS TDATA" *)
     output wire [31:0] m_axis_tdata,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS TVALID" *)
     output wire        m_axis_tvalid,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS TLAST" *)
     output wire        m_axis_tlast,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS TREADY" *)
     input  wire        m_axis_tready
 );
 

@@ -2,7 +2,7 @@
 # Use after modifying RTL source files.
 # Usage: vivado -mode batch -source scripts/rebuild.tcl
 
-set project_dir "/home/sonnensn/Music/edm_vivado"
+set project_dir "/home/sonnensn/edm_vivado"
 set project_name "edm_pynq"
 set root_dir [file normalize [file dirname [info script]]/..]
 

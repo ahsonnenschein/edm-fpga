@@ -1,20 +1,16 @@
 `timescale 1ns/1ps
-// waveform_capture.v  (rev 10 — decoupled BRAM capture, trigger-independent of DMA)
+// waveform_capture.v  (rev 7 — sample FIFO absorbs DMA backpressure)
 //
-// Architecture: two-phase capture
-//   Phase 1 (CAPTURE): trigger alone starts sampling into local BRAM.
-//     No dependency on m_axis_tready — capture timing is determined
-//     solely by the trigger and pair_ready, independent of DMA state.
-//   Phase 2 (STREAM):  after all samples are stored, stream the BRAM
-//     contents to the AXI DMA via AXI4-Stream.  tready is only checked
-//     here, where backpressure cannot affect capture alignment.
+// Root cause of "dropped pair_ready" bug: pair_ready is a single-cycle pulse
+// from xadc_drp_reader (~500 kHz, every ~200 clocks).  When the DMA deasserts
+// tready during DDR burst writes, the old FSM was stuck waiting and missed
+// incoming pair_ready pulses — samples were silently lost.
 //
-// This fixes the "first-period anomaly" where qualifying trigger on
-// tready caused capture to start on a random trigger relative to the
-// DMA arm, producing a uniform first-period distribution.
+// Fix: a small synchronous FIFO (32 deep) buffers {ch1, ch2, pulse_state}
+// on every pair_ready while capturing.  The AXI-Stream output FSM drains
+// from the FIFO, decoupled from XADC timing.  DMA burst pauses (~16 beats)
+// are fully absorbed.
 //
-// BRAM is single-port: written during CAPTURE, read during STREAM.
-// Max capture depth: 1024 samples (uses ~4 KB of BRAM).
 // HP0 dual-beat workaround retained: each sample output TWICE on AXI-S.
 
 module waveform_capture (
@@ -24,7 +20,7 @@ module waveform_capture (
     // Trigger: single-cycle pulse starts capture
     input  wire        trigger,
 
-    // Pulse output state (embedded in capture data)
+    // Pulse output state (embedded in capture data for diagnostics)
     input  wire        pulse_state,
 
     // Decoded XADC pair from xadc_drp_reader
@@ -45,123 +41,127 @@ module waveform_capture (
     output reg  [31:0] waveform_count
 );
 
-// ── Local BRAM buffer (1024 × 25 bits) ───────────────
-// Stores {ch1[11:0], ch2[11:0], pulse_state} per sample.
-// Written during CAPTURE phase, read during STREAM phase.
-localparam MAX_DEPTH = 1024;
-localparam ADDR_W    = 10;       // log2(1024)
-localparam SAMPLE_W  = 25;      // {ch1[11:0], ch2[11:0], pulse_state}
+wire trig_rise = trigger;
 
-(* ram_style = "block" *)
-reg [SAMPLE_W-1:0] bram [0:MAX_DEPTH-1];
+// ── Sample FIFO (32 deep × 25 bits) ──────────────────
+localparam FIFO_DEPTH = 32;
+localparam FIFO_AW    = 5;
+localparam FIFO_DW    = 25;  // {ch1[11:0], ch2[11:0], pulse_state}
 
-reg [ADDR_W-1:0] wr_addr;       // write pointer during CAPTURE
-reg [ADDR_W-1:0] rd_addr;       // read pointer during STREAM
-reg [15:0]       cap_len_lat;   // capture_len latched at trigger
-reg [15:0]       samples_stored;// samples written to BRAM
+reg [FIFO_DW-1:0] fifo_mem [0:FIFO_DEPTH-1];
+reg [FIFO_AW:0]   fifo_wr_ptr, fifo_rd_ptr;
 
-// ── FSM ──────────────────────────────────────────────
-localparam S_IDLE    = 3'd0;    // waiting for trigger
-localparam S_CAPTURE = 3'd1;    // filling BRAM from pair_ready
-localparam S_STREAM1 = 3'd2;    // AXI beat 1 (first copy)
-localparam S_STREAM2 = 3'd3;    // AXI beat 2 (HP0 duplicate)
-localparam S_DONE    = 3'd4;    // frame complete, back to IDLE
+wire fifo_empty = (fifo_wr_ptr == fifo_rd_ptr);
+wire fifo_full  = (fifo_wr_ptr[FIFO_AW] != fifo_rd_ptr[FIFO_AW]) &&
+                  (fifo_wr_ptr[FIFO_AW-1:0] == fifo_rd_ptr[FIFO_AW-1:0]);
 
-reg [2:0]  state;
-reg [15:0] stream_cnt;          // samples remaining to stream
+wire fifo_wr_en = pair_ready & capturing & ~fifo_full;
+
+always @(posedge clk) begin
+    if (fifo_wr_en)
+        fifo_mem[fifo_wr_ptr[FIFO_AW-1:0]] <= {ch1_data, ch2_data, pulse_state};
+end
+
+wire [FIFO_DW-1:0] fifo_rd_data = fifo_mem[fifo_rd_ptr[FIFO_AW-1:0]];
+
+// ── Output FSM ────────────────────────────────────────
+localparam S_IDLE  = 2'd0;
+localparam S_POP   = 2'd1;  // wait for FIFO, pop, present beat 1
+localparam S_BEAT1 = 2'd2;  // beat 1 on bus, waiting for accept
+localparam S_BEAT2 = 2'd3;  // beat 2 (duplicate) on bus, waiting for accept
+
+reg [1:0]  state;
+reg [15:0] sample_cnt;     // samples remaining to output
+reg [15:0] samples_in;     // samples written into FIFO so far
+reg [15:0] cap_len_lat;    // capture_len latched at trigger (immune to mid-capture changes)
 reg        last_sample;
 
-// Registered BRAM read data (one cycle read latency)
-reg [SAMPLE_W-1:0] rd_data;
+// Registered copy of FIFO data for output (holds through both beats)
+reg [FIFO_DW-1:0] sample_reg;
 
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         state          <= S_IDLE;
-        capturing      <= 1'b0;
-        waveform_count <= 32'd0;
-        wr_addr        <= 0;
-        rd_addr        <= 0;
-        cap_len_lat    <= 16'd0;
-        samples_stored <= 16'd0;
-        stream_cnt     <= 16'd0;
-        last_sample    <= 1'b0;
+        sample_cnt     <= 16'd0;
+        samples_in     <= 16'd0;
         m_axis_tdata   <= 32'd0;
         m_axis_tvalid  <= 1'b0;
         m_axis_tlast   <= 1'b0;
-        rd_data        <= 0;
+        capturing      <= 1'b0;
+        waveform_count <= 32'd0;
+        last_sample    <= 1'b0;
+        sample_reg     <= 0;
+        cap_len_lat    <= 16'd0;
+        fifo_wr_ptr    <= 0;
+        fifo_rd_ptr    <= 0;
     end else begin
 
-        case (state)
+        // Count samples entering FIFO
+        if (fifo_wr_en) begin
+            fifo_wr_ptr <= fifo_wr_ptr + 1;
+            samples_in  <= samples_in + 16'd1;
+        end
 
-            // ── IDLE: wait for trigger (NO tready check) ────
+        // Stop accepting once we have enough (use latched value)
+        if (capturing && samples_in >= cap_len_lat)
+            capturing <= 1'b0;
+
+        case (state)
+            // ── IDLE ────────────────────────────────────────
             S_IDLE: begin
-                // Clear tvalid from previous frame's last beat
                 if (m_axis_tvalid && m_axis_tready)
                     m_axis_tvalid <= 1'b0;
 
-                if (trigger && capture_len > 0) begin
-                    capturing      <= 1'b1;
-                    cap_len_lat    <= capture_len;
-                    samples_stored <= 16'd0;
-                    wr_addr        <= 0;
-                    state          <= S_CAPTURE;
+                if (trig_rise && capture_len > 0 && m_axis_tready) begin
+                    capturing   <= 1'b1;
+                    sample_cnt  <= capture_len;
+                    cap_len_lat <= capture_len;
+                    samples_in  <= 16'd0;
+                    fifo_wr_ptr <= 0;
+                    fifo_rd_ptr <= 0;
+                    state       <= S_POP;
                 end
             end
 
-            // ── CAPTURE: store samples into BRAM ────────────
-            S_CAPTURE: begin
-                if (pair_ready && samples_stored < cap_len_lat) begin
-                    bram[wr_addr] <= {ch1_data, ch2_data, pulse_state};
-                    wr_addr        <= wr_addr + 1;
-                    samples_stored <= samples_stored + 16'd1;
-                end
-
-                // All samples collected → start streaming
-                if (samples_stored >= cap_len_lat) begin
-                    capturing  <= 1'b0;
-                    rd_addr    <= 0;
-                    stream_cnt <= cap_len_lat;
-                    // Initiate first BRAM read (1-cycle latency)
-                    rd_data    <= bram[0];
-                    rd_addr    <= 1;
-                    state      <= S_STREAM1;
+            // ── POP: wait for FIFO non-empty, latch sample ─
+            S_POP: begin
+                if (!fifo_empty) begin
+                    sample_reg  <= fifo_rd_data;
+                    fifo_rd_ptr <= fifo_rd_ptr + 1;
+                    last_sample <= (sample_cnt <= 16'd1);
+                    state       <= S_BEAT1;
                 end
             end
 
-            // ── STREAM1: present beat 1, wait for accept ────
-            // Data format: {ch1[11:0], 4'b0, ch2[11:0], 3'b0, pulse_state}
-            S_STREAM1: begin
-                m_axis_tdata  <= {rd_data[24:13], 4'b0000,
-                                  rd_data[12:1],  3'b000,
-                                  rd_data[0]};
+            // ── BEAT1: present first beat, wait for accept ──
+            S_BEAT1: begin
+                m_axis_tdata  <= {sample_reg[24:13], 4'b0000,
+                                  sample_reg[12:1],  3'b000,
+                                  sample_reg[0]};
                 m_axis_tvalid <= 1'b1;
                 m_axis_tlast  <= 1'b0;
-                last_sample   <= (stream_cnt <= 16'd1);
-
                 if (m_axis_tvalid && m_axis_tready) begin
                     // Beat 1 accepted → present duplicate
-                    state <= S_STREAM2;
-                    if (stream_cnt <= 16'd1)
+                    state <= S_BEAT2;
+                    if (last_sample)
                         m_axis_tlast <= 1'b1;
                 end
             end
 
-            // ── STREAM2: duplicate beat, wait for accept ────
-            S_STREAM2: begin
+            // ── BEAT2: duplicate beat, wait for accept ──────
+            S_BEAT2: begin
                 // tdata unchanged, tvalid stays 1
                 if (m_axis_tvalid && m_axis_tready) begin
+                    // Beat 2 accepted
                     m_axis_tvalid <= 1'b0;
                     m_axis_tlast  <= 1'b0;
-
                     if (last_sample) begin
                         waveform_count <= waveform_count + 32'd1;
+                        capturing      <= 1'b0;
                         state          <= S_IDLE;
                     end else begin
-                        stream_cnt <= stream_cnt - 16'd1;
-                        // Read next sample from BRAM
-                        rd_data    <= bram[rd_addr];
-                        rd_addr    <= rd_addr + 1;
-                        state      <= S_STREAM1;
+                        sample_cnt <= sample_cnt - 16'd1;
+                        state      <= S_POP;
                     end
                 end
             end
