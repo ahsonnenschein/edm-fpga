@@ -50,11 +50,13 @@ set_property -dict [list \
     CONFIG.PCW_S_AXI_HP0_DATA_WIDTH      {32} \
     CONFIG.PCW_UART1_PERIPHERAL_ENABLE   {1} \
     CONFIG.PCW_UART1_UART1_IO            {EMIO} \
+    CONFIG.PCW_USE_FABRIC_INTERRUPT      {1} \
+    CONFIG.PCW_IRQ_F2P_INTR             {1} \
 ] [get_bd_cells ps7]
 apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \
     -config {make_external "FIXED_IO, DDR"} [get_bd_cells ps7]
 
-# Re-apply FCLK after automation (apply_bd_automation can override PLL settings)
+# Re-apply settings after automation (apply_bd_automation overrides them)
 set_property CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {100.000000} [get_bd_cells ps7]
 
 # ── XADC Wizard ────────────────────────────────────────
@@ -175,6 +177,8 @@ connect_bd_intf_net [get_bd_intf_pins axi_dma_0/M_AXI_S2MM] \
 connect_bd_intf_net [get_bd_intf_pins axi_proto_conv_0/M_AXI] \
                     [get_bd_intf_pins ps7/S_AXI_HP0]
 
+# DMA S2MM interrupt: deferred until after all connections (see below)
+
 # -------------------------------------------------------
 # XADC DRP signals → edm_ctrl (xadc_drp_reader)
 # -------------------------------------------------------
@@ -234,7 +238,25 @@ foreach seg $all_segs {
 }
 
 # -------------------------------------------------------
-# Validate, save, wrap, and build
+# Enable fabric interrupts and connect DMA interrupt.
+# Must be done AFTER all other connections are made, because:
+# 1. apply_bd_automation resets PCW_USE_FABRIC_INTERRUPT to 0
+# 2. The PS7 doesn't regenerate IRQ_F2P pin until validate_bd_design
+# 3. validate_bd_design requires all clocks/resets connected first
+# -------------------------------------------------------
+set_property CONFIG.PCW_USE_FABRIC_INTERRUPT {1} [get_bd_cells ps7]
+set_property CONFIG.PCW_IRQ_F2P_INTR {1} [get_bd_cells ps7]
+validate_bd_design
+puts "IRQ_F2P pin exists: [llength [get_bd_pins -quiet ps7/IRQ_F2P]]"
+if {[llength [get_bd_pins -quiet ps7/IRQ_F2P]] > 0} {
+    connect_bd_net [get_bd_pins axi_dma_0/s2mm_introut] [get_bd_pins ps7/IRQ_F2P]
+    puts "DMA interrupt connected to PS IRQ_F2P"
+} else {
+    puts "WARNING: IRQ_F2P pin not found — DMA interrupts will not work"
+}
+
+# -------------------------------------------------------
+# Re-validate, save, wrap, and build
 # -------------------------------------------------------
 validate_bd_design
 save_bd_design

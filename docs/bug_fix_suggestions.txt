@@ -1,0 +1,264 @@
+Yes. Based on your report, I would focus on this as an arming / stream-boundary bug, not an analog sampling bug. The data you collected is actually quite strong on that point: replacing pair_ready with a fixed-rate sample_tick did not change the distribution, so the root cause is almost certainly downstream of XADC conversion cadence.
+
+My best guess is that your capture block is not actually acquiring “the burst that starts at the trigger that armed this DMA transfer.” Instead, it is sometimes handing software a burst whose logical start is offset by an arbitrary amount within one pulse period. The fact that the offset range matches the full Toff in samples is the giveaway.
+
+Here are the fixes I would try, in order.
+
+1. Stop using m_axis_tready as part of the trigger qualification
+
+This is the first design choice I would attack.
+
+Right now you only begin capture when all of these are true inside S_IDLE:
+
+- trig_rise
+- capture_len > 0
+- m_axis_tready
+
+That means the capture-start event is being defined by the coincidence of an external trigger and a downstream AXI sink readiness signal. That is fragile. If tready is late, sticky, glitchy, or remains asserted across transfer boundaries, then your capture start can effectively “slip” relative to the pulse train even though the pulse train itself is rock solid.
+
+I would redesign this so that:
+
+- trig_rise alone starts an internal capture transaction
+- samples are written into a local FIFO or BRAM buffer independent of DMA readiness
+- AXI streaming happens afterward, as a separate phase
+
+In other words, decouple:
+
+1. physical event detection
+2. sample collection
+3. DMA draining
+
+That is the single most important architectural change I would suggest.
+
+A very robust structure would be:
+
+- IDLE
+- on trig_rise: latch capture_pending, reset counters, start storing samples locally
+- once capture_len samples are in local memory, assert frame_ready
+- only then begin AXI stream to DMA
+- ignore further triggers until frame fully committed, or explicitly queue one pending trigger
+
+This removes AXI backpressure from the definition of “where the waveform starts.”
+
+2. Add an explicit one-shot “armed” latch
+
+Your current behavior suggests you may be accidentally accepting a trigger that is not uniquely associated with the DMA arm the software thinks it issued.
+
+I would add a bit with semantics like this:
+
+- software writes arm_capture = 1
+- hardware enters ARMED_WAIT_TRIGGER
+- the next valid trig_rise consumes that arm and immediately clears it
+- no other trigger is allowed to start capture until software arms again
+
+That sounds obvious, but the key is to make it a true one-shot with a visible state transition. Right now the report suggests the system may be effectively “open for business” whenever S_IDLE && tready happens to line up, which is too permissive.
+
+Pseudo-RTL sketch:
+
+if (sw_arm_pulse) begin
+    armed <= 1'b1;
+end
+
+case (state)
+  S_IDLE: begin
+    if (armed && trig_rise) begin
+      armed <= 1'b0;
+      start_capture <= 1'b1;
+      state <= S_CAPTURING;
+    end
+  end
+
+Then expose armed, capture_started, and capture_done in registers so software can verify the sequence.
+
+3. Tag each capture with a monotonically increasing capture ID generated at trigger time
+
+You already have waveform_count, but I would make it more explicit.
+
+At the exact cycle where the trigger is accepted, latch:
+
+- capture_id
+- trigger_timestamp
+- maybe pulse_counter
+
+Then store that metadata at the front of the frame or in sideband registers. That will let you distinguish:
+
+- “DMA completed”
+from
+- “the trigger I meant to capture was accepted”
+
+This matters because a lot of these bugs come from software assuming DMA completion uniquely identifies the intended acquisition. Your data already suggests that may not be true.
+
+4. Force tvalid/tlast generation to be self-contained once a capture starts
+
+Another possibility is that the AXI stream side is leaking state across frames.
+
+Once you accept a trigger, the following should be invariant:
+
+- exactly capture_len words are produced
+- exactly one tlast occurs on the final word
+- no samples from earlier or later pulse epochs can mix into the frame
+- tvalid cannot depend on fresh triggers anymore
+
+If your current design allows FIFO filling and AXI draining to overlap in a loose way, then a boundary bug is plausible. The symptom “first interval random, then everything regular” is exactly what you see when the head of frame is not anchored but the internal cadence after that is fine.
+
+I would therefore make the capture engine frame-oriented, not stream-oriented.
+
+5. Replace the live FIFO with ping-pong BRAM for debugging
+
+For root causing this, I would seriously consider temporarily abandoning the streaming FIFO architecture.
+
+Use two BRAM buffers:
+
+- buffer A fills on trigger N
+- buffer B streams to DMA
+- then swap
+
+That makes the design vastly easier to reason about. It costs memory, but for ~200 samples × 32 bits, it is trivial on a Zynq-7020.
+
+This has several advantages:
+
+- no read/write same-address ambiguity
+- no READ_FIRST / WRITE_FIRST weirdness
+- no possibility that AXI backpressure perturbs acquisition timing
+- easy to add trigger metadata at a fixed address
+
+Your suspicion about BRAM mode is not crazy, but I would not chase that first. I would simplify the architecture until the bug disappears or becomes obvious.
+
+6. Add one more diagnostic bit: “accepted_trigger”
+
+You already plan to probe pulse_trigger, m_axis_tready, state, capturing, waveform_count, and pulse_out. That is good.
+
+I would also explicitly probe:
+
+- accepted_trigger = (state == S_IDLE) && armed && trig_rise && capture_len > 0 && start_condition
+- arm_capture
+- sample_index
+- fifo_level or local buffer write pointer
+- frame_id
+
+That matters because pulse_trigger may be correct while the actual acceptance condition is not. The mystery is not whether the trigger exists; it is which trigger the capture FSM is actually consuming.
+
+If I had to choose only one ILA trigger condition, I would use:
+
+- trigger on accepted_trigger
+
+not on raw pulse_trigger.
+
+Then inspect:
+
+- what was m_axis_tready doing in the preceding few hundred clocks?
+- had a previous frame really ended?
+- did accepted_trigger occur on the pulse you think it did?
+- does the write pointer start at zero on that same event?
+
+7. Remove any possibility of stale data at frame head
+
+I would explicitly zero or invalidate the capture storage on frame start during debugging.
+
+For example:
+
+- reset write pointer to 0
+- clear “frame valid length”
+- optionally write a recognizable header word at element 0
+
+Then confirm in software that word 0 of the DMA buffer is from the new frame, not an old one.
+
+Given your result that ts[0] spans essentially the whole modulo range, stale-head or wrong-frame association is still on the table.
+
+8. Make the software wait for a hardware “capture accepted” flag, not just DMA non-idle
+
+Your current software sequence is:
+
+- arm DMA
+- poll until non-idle
+- poll until complete
+- read buffer
+
+That tells you the DMA ran, but not necessarily that the intended trigger was the first eligible one after arm.
+
+I would add a register written by hardware at accepted-trigger time:
+
+- capture_accepted_count
+- capture_accepted_timestamp
+- capture_id
+
+Then software should do:
+
+1. write arm_capture
+2. remember previous capture_id
+3. wait until capture_id increments
+4. only then expect DMA completion for that frame
+
+That would eliminate ambiguity between “DMA happened” and “correct trigger got bound to this buffer.”
+
+9. I would not spend much time on the XADC calibration issue for this bug
+
+You found a real calibration gap near sample 34, and that is useful. But since the first-period anomaly survived the fixed-rate capture rewrite, it is very unlikely to be causal for the main bug.
+
+So I would treat the calibration behavior as a separate cleanup item, not the present blocker.
+
+10. A concrete minimal experiment that should be very revealing
+
+Here is the fastest experiment I would run next:
+
+Modify the hardware so that:
+- trigger alone starts a local BRAM capture of 64 samples
+- no AXI/DMA dependence at capture start
+- after all 64 samples are stored, then stream them out
+- prepend a 32-bit header containing:
+  - low bits of a free-running counter
+  - capture ID
+  - maybe pulse counter modulo 256
+
+Then in software:
+- arm capture one shot
+- wait for capture_id increment
+- receive buffer
+- check whether the first pulse-to-second-pulse interval is now always 47–48
+
+If that fixes it, the problem is definitely in your current coupling between trigger acceptance and AXI readiness. If it does not, then I would move suspicion to trigger generation/CDC/state aliasing.
+
+11. One more thing I would scrutinize: are all relevant signals in the same clock domain?
+
+Your description makes it sound as though:
+
+- pulse controller
+- capture FSM
+- AXI stream interface
+
+are all synchronous to the same 100 MHz domain. If that is truly so, good.
+
+But if any of these are crossing domains without an explicit handshake:
+
+- hv_enable_sync
+- AXI DMA backpressure path
+- XADC DRP output timing into capture path
+
+then an occasional boundary slip is plausible.
+
+Still, the uniform distribution over one pulse period does not smell like a classic metastability problem. It smells more like the system is regularly capturing the wrong phase-aligned frame, not randomly corrupting a few cycles.
+
+My ranking of likely causes
+
+From most likely to less likely:
+
+1. Capture start is improperly qualified by m_axis_tready, causing the wrong trigger to be bound to a frame
+2. DMA/AXI stream remains effectively receptive across frame boundaries, allowing phantom or stale-start captures
+3. Frame-head data is stale or mis-associated, while the rest of frame is fresh
+4. FIFO/BRAM boundary hazard
+5. Clock-domain issue
+6. Anything XADC-related
+
+My practical recommendation
+
+I would not try to “patch” the existing FIFO-streaming design first. I would make a temporary but much more deterministic architecture:
+
+- one-shot arm
+- trigger-owned local capture
+- post-capture DMA drain
+- capture metadata/header
+- ILA on accepted trigger, not raw trigger
+
+That is the shortest path to certainty.
+
+Your workaround capture_len=47 is reasonable operationally, but architecturally it is just hiding a boundary association bug. I would not trust any quantitative timing result from this capture path until the trigger-to-frame ownership is made explicit in hardware.

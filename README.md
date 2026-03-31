@@ -456,26 +456,11 @@ pair_rate = 100 MHz / (4 × 26 cycles × 2 channels) = 480.769 kSPS
 ```
 The display time axis must use 480769, not 500000, for accurate pulse timing.  Additionally, XADC automatic calibration inserts extra conversion cycles approximately every 34 samples, creating periodic timing gaps in the `pair_ready` stream.
 
-### 13. Overlay load can crash the board — assert FPGA resets via SLCR first
+### 13. Overlay load can crash the board — avoid accessing PL before load
 
-Loading a PYNQ overlay reprograms the PL, destroying all AXI interconnects.  If any PS→PL AXI transaction is in flight (stale DMA, cached MMIO), the bus error crashes the kernel.  Simply resetting the DMA is not enough — any cached or pending AXI transaction can cause a fault.
+Loading a PYNQ overlay reprograms the PL, destroying all AXI interconnects.  If any PS→PL AXI transaction is in flight (stale DMA, cached MMIO), the bus error crashes the kernel.  Do NOT access any PL-mapped address (0x40000000+) before the overlay is loaded — even a "pre-reset" write to the DMA causes a bus error on fresh boot when the PL is unprogrammed.
 
-**Fix:** Assert all FPGA resets via the Zynq SLCR register `FPGA_RST_CTRL` (`0xF8000240`) before loading the overlay.  This safely quiesces all PL-side logic:
-```python
-import mmap, struct
-fd = open("/dev/mem", "r+b")
-slcr = mmap.mmap(fd.fileno(), 0x1000, offset=0xF8000000)
-slcr.seek(0x008); slcr.write(struct.pack("<I", 0xDF0D))     # unlock SLCR
-slcr.seek(0x240); slcr.write(struct.pack("<I", 0x0F))       # assert FPGA resets
-slcr.seek(0x004); slcr.write(struct.pack("<I", 0x767B))     # lock SLCR
-slcr.close(); fd.close()
-time.sleep(0.01)
-
-ol = Overlay(OVERLAY_BIT)   # safe — no in-flight AXI transactions
-
-# Deassert FPGA resets after load (same SLCR unlock/write 0x00/lock sequence)
-```
-This makes overlay loading reliable over SSH — no more crashes or power cycles needed.
+On reboot, the overlay load usually succeeds on the first try.  If it fails with EIO, the FPGA manager enters an error state that requires a power cycle.
 
 ### 14. PS UART1 via device tree overlay is unreliable — use MMIO instead
 
@@ -487,3 +472,32 @@ Sending separate `w10` (voltage) and `w11` (current) commands back-to-back at 96
 ```
 :01w20=5000,1500,\r\n    → 50.00 V, 1.500 A
 ```
+
+### 16. AXI DMA interrupt MUST be connected for PYNQ compatibility
+
+PYNQ's `Overlay` class auto-detects the AXI DMA IP from the HWH file and assigns its `pynq.lib.dma.DMA` driver.  This driver **takes exclusive ownership** of the DMA registers — raw MMIO writes to the DMA control register (0x40400030) are silently ignored.  The driver uses interrupt-based completion detection via `IRQ_F2P`.
+
+If the DMA interrupt (`s2mm_introut`) is NOT connected to `ps7/IRQ_F2P`, the PYNQ DMA driver hangs on `wait()` and the DMA is completely unusable (both through PYNQ API and raw MMIO).
+
+**Fix:** In `create_project.tcl`, enable fabric interrupts and connect the DMA interrupt:
+```tcl
+set_property CONFIG.PCW_USE_FABRIC_INTERRUPT {1} [get_bd_cells ps7]
+set_property CONFIG.PCW_IRQ_F2P_INTR {1} [get_bd_cells ps7]
+connect_bd_net [get_bd_pins axi_dma_0/s2mm_introut] [get_bd_pins ps7/IRQ_F2P]
+```
+
+Without this, the DMA control register reads back 0x00010006 regardless of what is written, `waveform_count` stays at 0, and no burst data is produced.
+
+### 17. Module reference AXI-Stream needs X_INTERFACE attributes for clock association
+
+When using `create_bd_cell -type module -reference` for RTL modules in Vivado, the block design cannot set `ASSOCIATED_BUSIF` on clock pins (the property is read-only for module references).  Without clock association, IPI warns "AXI interface pin M_AXIS is not associated to any clock pin."
+
+**Fix:** Add Verilog attributes directly in the RTL:
+```verilog
+(* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF S_AXI:M_AXIS, ASSOCIATED_RESET S_AXI_ARESETN" *)
+input wire S_AXI_ACLK,
+
+(* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS TDATA" *)
+output wire [31:0] m_axis_tdata,
+```
+This tells Vivado at the HDL level which bus interfaces share which clock, eliminating the warning and ensuring proper timing constraints.
