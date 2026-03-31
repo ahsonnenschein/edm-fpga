@@ -2,9 +2,9 @@
 """
 xadc_server.py  —  Board-side data server for EDM PYNQ-Z2 controller
 
-Uses PYNQ DMA API with waveform_count polling for completion detection.
-Must be the FIRST overlay load after power cycle — FPGA manager cannot
-reload after the first download.
+Rev 11: Reads waveform data via AXI-Lite MMIO (no DMA).
+Waveform samples are in BRAM at register offsets 0x800-0xFFC.
+No AXI DMA, no PYNQ DMA driver, no tready issues.
 """
 
 import os, time, json, socket, threading, struct, sys
@@ -16,10 +16,12 @@ import numpy as np
 
 PSU_BAUD    = 9600
 EDM_BASE    = 0x43C00000
+EDM_SIZE    = 0x1000        # 4KB — control regs + waveform BRAM
 SAMPLE_HZ   = 200
 TCP_PORT    = 5006
 OVERLAY_BIT = '/home/xilinx/edm_pynq.bit'
 
+# Control register offsets
 REG_TON           = 0x00
 REG_TOFF          = 0x04
 REG_ENABLE        = 0x08
@@ -31,10 +33,13 @@ REG_XADC_CH1      = 0x1C
 REG_XADC_CH2      = 0x20
 REG_XADC_TEMP     = 0x24
 
+# Waveform BRAM base offset (within the same AXI-Lite slave)
+BRAM_BASE         = 0x800   # samples at 0x800, 0x804, ..., 0xFFC (512 max)
+
 CH1_DIVIDER = 1.0
 CH1_PROBE   = 50.0
 CH2_RANGE   = 4.95
-MAX_CAPTURE = 1024
+MAX_CAPTURE = 512
 
 
 # ── DPH8909 PSU driver (MMIO UART1) ─────────────────────────────────────────
@@ -44,8 +49,8 @@ class DPH8909:
         import mmap
         self._addr = 1
         self._lock = threading.Lock()
-        slcr_fd = open("/dev/mem", "r+b")
-        slcr = mmap.mmap(slcr_fd.fileno(), 0x1000, offset=0xF8000000)
+        fd = open("/dev/mem", "r+b")
+        slcr = mmap.mmap(fd.fileno(), 0x1000, offset=0xF8000000)
         def sw(m,o,v): m.seek(o); m.write(struct.pack("<I",v&0xFFFFFFFF))
         def sr(m,o): m.seek(o); return struct.unpack("<I",m.read(4))[0]
         sw(slcr,0x008,0xDF0D)
@@ -53,7 +58,7 @@ class DPH8909:
         sw(slcr,0x12C,sr(slcr,0x12C)|(1<<21))
         sw(slcr,0x228,sr(slcr,0x228)&~0x0C)
         sw(slcr,0x004,0x767B)
-        slcr.close(); slcr_fd.close()
+        slcr.close(); fd.close()
         time.sleep(0.01)
         ufd = open("/dev/mem","r+b")
         self._um = mmap.mmap(ufd.fileno(),0x1000,offset=0xE0001000)
@@ -66,17 +71,14 @@ class DPH8909:
     def _uw(self,o,v): self._um.seek(o); self._um.write(struct.pack("<I",v&0xFFFFFFFF))
     def _ur(self,o): self._um.seek(o); return struct.unpack("<I",self._um.read(4))[0]
     def close(self): pass
-
     def _flush(self):
         for _ in range(64):
             if self._ur(0x2C)&0x02: break
             self._ur(0x30)
-
     def _wb(self,data):
         for b in data:
             while self._ur(0x2C)&0x10: pass
             self._uw(0x30,b)
-
     def _rl(self,timeout=0.5):
         buf=bytearray(); t0=time.time()
         while time.time()-t0<timeout:
@@ -84,17 +86,14 @@ class DPH8909:
             ch=self._ur(0x30)&0xFF; buf.append(ch)
             if ch==0x0A: break
         return buf.decode(errors='replace').strip()
-
     def _send(self,f,c,v):
         frame=f":{self._addr:02d}{f}{c:02d}={v},\r\n".encode()
         with self._lock: self._flush(); self._wb(frame)
-
     def _query(self,c):
         frame=f":{self._addr:02d}r{c:02d}=0,\r\n".encode()
         with self._lock: self._flush(); self._wb(frame); resp=self._rl()
         if not resp: raise IOError("No response")
         sep=max(resp.rfind('='),resp.rfind(':')); return int(resp[sep+1:].rstrip(','))
-
     def set_voltage(self,v): self._send('w',10,round(v*100))
     def set_current(self,a): self._send('w',11,round(a*1000))
     def set_voltage_current(self,v,a):
@@ -108,16 +107,14 @@ class DPH8909:
 
 class EdmServer:
     def __init__(self):
-        from pynq import Overlay, MMIO, allocate
-        from pynq.lib.dma import DMA
+        from pynq import Overlay, MMIO
 
         self._lock    = threading.Lock()
         self._clients = []
         self._running = True
 
-        # Load overlay — must be first load after power cycle
         print(f"Loading overlay: {OVERLAY_BIT}")
-        self._ol = Overlay(OVERLAY_BIT)
+        Overlay(OVERLAY_BIT)
         time.sleep(1)
         print("Overlay loaded.")
 
@@ -129,15 +126,12 @@ class EdmServer:
         else:
             print(f"FCLK_CLK0 = {actual:.1f} MHz (OK)")
 
-        self._edm = MMIO(EDM_BASE, 0x28)
-        self._dma = self._ol.axi_dma_0
-        print(f"DMA driver: {type(self._dma).__name__}")
+        # Single MMIO mapping covers control regs AND waveform BRAM
+        self._edm = MMIO(EDM_BASE, EDM_SIZE)
+        print(f"EDM MMIO: 0x{EDM_BASE:08X}, {EDM_SIZE} bytes")
 
-        self._capture_len = 100
-        self._buf = allocate(shape=(self._capture_len * 2,), dtype=np.uint32)
-        print(f"DMA buffer: {self._capture_len} samples, {len(self._buf)*4} bytes")
-
-        self._edm.write(REG_CAPTURE_LEN, self._capture_len)
+        self._edm.write(REG_CAPTURE_LEN, 100)
+        print("Capture length set to 100 samples")
 
         # PSU
         self._psu = None; self._psu_vout = None; self._psu_iout = None
@@ -156,6 +150,8 @@ class EdmServer:
 
     def _write_edm(self, offset, value):
         with self._lock: self._edm.write(offset, value)
+
+    # ── 200 Hz status stream ─────────────────────────────
 
     def _status_loop(self):
         interval = 1.0 / SAMPLE_HZ
@@ -184,46 +180,42 @@ class EdmServer:
             elapsed = time.time() - t0
             time.sleep(max(0, interval - elapsed))
 
-    def _dma_loop(self):
-        """PYNQ DMA API + waveform_count polling for completion."""
-        from pynq import allocate
+    # ── Waveform capture via AXI-Lite BRAM readout ───────
+
+    def _capture_loop(self):
+        """Poll waveform_count, read BRAM via MMIO when new capture ready."""
         last_wf_count = self._edm.read(REG_WAVEFORM_CNT)
         _last_tx = 0.0
         _ok = 0
 
         while self._running:
             try:
-                # Arm DMA via PYNQ (buffer must match capture_len exactly)
-                self._dma.recvchannel.transfer(self._buf)
-
-                # Poll waveform_count for completion
-                deadline = time.time() + 5.0
-                done = False
-                while time.time() < deadline:
-                    wfc = self._edm.read(REG_WAVEFORM_CNT)
-                    if wfc != last_wf_count:
-                        done = True
-                        break
-                    time.sleep(0.0002)
-
-                if not done:
-                    if _ok == 0:
-                        print(f"DMA: waveform_count stuck at {last_wf_count}")
+                wfc = self._edm.read(REG_WAVEFORM_CNT)
+                if wfc == last_wf_count:
+                    time.sleep(0.0005)
                     continue
 
                 _ok += 1
                 last_wf_count = wfc
+
+                capture_len = self._edm.read(REG_CAPTURE_LEN) & 0xFFFF
+                capture_len = min(capture_len, MAX_CAPTURE)
+
                 if _ok <= 5 or _ok % 500 == 0:
-                    print(f"DMA capture #{_ok}: wfc={wfc}")
+                    print(f"Capture #{_ok}: wfc={wfc} cap={capture_len}")
 
-                self._buf.invalidate()
-                words = np.array(self._buf[:cap*2:2], dtype=np.uint32)
-                ch1_raw = ((words>>20)&0xFFF).astype(np.float32)
-                ch2_raw = ((words>>4)&0xFFF).astype(np.float32)
-                pulse = (words&0x1).astype(np.int32)
-                ch1_v = (ch1_raw/4096.0*CH1_DIVIDER*CH1_PROBE).tolist()
-                ch2_v = (ch2_raw/4096.0*CH2_RANGE).tolist()
+                # Read waveform samples from BRAM via MMIO
+                words = np.zeros(capture_len, dtype=np.uint32)
+                for i in range(capture_len):
+                    words[i] = self._edm.read(BRAM_BASE + i * 4)
 
+                ch1_raw = ((words >> 20) & 0xFFF).astype(np.float32)
+                ch2_raw = ((words >> 4) & 0xFFF).astype(np.float32)
+                pulse_bits = (words & 0x1).astype(np.int32)
+                ch1_v = (ch1_raw / 4096.0 * CH1_DIVIDER * CH1_PROBE).tolist()
+                ch2_v = (ch2_raw / 4096.0 * CH2_RANGE).tolist()
+
+                # Rate-limit broadcasts
                 now = time.time()
                 if now - _last_tx < 0.01:
                     continue
@@ -233,12 +225,14 @@ class EdmServer:
                     'type':'burst','waveform_count':int(wfc),
                     'ch1':[round(v,4) for v in ch1_v],
                     'ch2':[round(v,4) for v in ch2_v],
-                    'pulse':pulse.tolist(),
+                    'pulse':pulse_bits.tolist(),
                 }).encode()+b'\n')
 
             except Exception as e:
-                print(f"DMA error: {e}")
-                time.sleep(0.5)
+                print(f"Capture error: {e}")
+                time.sleep(0.1)
+
+    # ── TCP ──────────────────────────────────────────────
 
     def _broadcast(self, frame):
         dead = []
@@ -296,7 +290,7 @@ class EdmServer:
 
     def run(self):
         threading.Thread(target=self._status_loop, daemon=True).start()
-        threading.Thread(target=self._dma_loop, daemon=True).start()
+        threading.Thread(target=self._capture_loop, daemon=True).start()
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(('0.0.0.0', TCP_PORT)); srv.listen(4)

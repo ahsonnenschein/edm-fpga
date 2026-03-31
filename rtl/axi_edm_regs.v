@@ -3,20 +3,21 @@
 // AXI4-Lite slave register file for EDM controller.
 //
 // Register map (byte addresses, 32-bit words):
-//   0x00  ton_cycles      RW  Ton in clock cycles (ton_us * 100)
-//   0x04  toff_cycles     RW  Toff in clock cycles
-//   0x08  enable          RW  bit[0]: 1=run, 0=stop
-//   0x0C  pulse_count     RO  Running count of pulses fired
-//   0x10  hv_enable       RO  bit[0]: operator HV switch state
-//   0x14  capture_len     RW  Waveform pairs to capture per pulse (default 10)
-//   0x18  waveform_count  RO  Number of waveforms captured since reset
-//   0x1C  xadc_ch1_raw    RO  Latest CH1 (VP/VN) 12-bit value latched from stream
-//   0x20  xadc_ch2_raw    RO  Latest CH2 (VAUX1) 12-bit value latched from stream
-//   0x24  xadc_temp_raw   RO  Latest temperature 12-bit value latched from stream
+//   0x000  ton_cycles      RW  Ton in clock cycles
+//   0x004  toff_cycles     RW  Toff in clock cycles
+//   0x008  enable          RW  bit[0]: 1=run, 0=stop
+//   0x00C  pulse_count     RO  Running count of pulses fired
+//   0x010  hv_enable       RO  bit[0]: operator HV switch state
+//   0x014  capture_len     RW  Waveform pairs to capture per pulse
+//   0x018  waveform_count  RO  Number of waveforms captured since reset
+//   0x01C  xadc_ch1_raw    RO  Latest CH1 12-bit value
+//   0x020  xadc_ch2_raw    RO  Latest CH2 12-bit value
+//   0x024  xadc_temp_raw   RO  Latest temperature 12-bit value
+//   0x800-0xFFC  waveform BRAM  RO  Captured samples (up to 512 words)
 
 module axi_edm_regs #(
     parameter C_S_AXI_DATA_WIDTH = 32,
-    parameter C_S_AXI_ADDR_WIDTH = 6   // bits [5:2] → 16 word registers (0x00-0x3C)
+    parameter C_S_AXI_ADDR_WIDTH = 12   // 4KB address space
 )(
     input  wire                             S_AXI_ACLK,
     input  wire                             S_AXI_ARESETN,
@@ -51,14 +52,21 @@ module axi_edm_regs #(
     input  wire        hv_enable_in,
     input  wire [31:0] waveform_count,
 
-    // XADC latched values (from stream tap in edm_top)
+    // XADC latched values
     input  wire [11:0] xadc_ch1_raw,
     input  wire [11:0] xadc_ch2_raw,
-    input  wire [11:0] xadc_temp_raw
+    input  wire [11:0] xadc_temp_raw,
+
+    // Waveform BRAM read port
+    output wire [8:0]  bram_rd_addr,
+    input  wire [31:0] bram_rd_data
 );
 
 reg [C_S_AXI_ADDR_WIDTH-1:0] axi_awaddr;
 reg [C_S_AXI_ADDR_WIDTH-1:0] axi_araddr;
+
+// BRAM address from AXI read address: bits [10:2] when bit 11 is set
+assign bram_rd_addr = axi_araddr[10:2];
 
 // ── Write channel ──────────────────────────────────────
 always @(posedge S_AXI_ACLK) begin
@@ -71,7 +79,7 @@ always @(posedge S_AXI_ACLK) begin
         ton_cycles    <= 32'd1000;
         toff_cycles   <= 32'd9000;
         enable        <= 1'b0;
-        capture_len   <= 16'd10;
+        capture_len   <= 16'd100;
     end else begin
         if (!S_AXI_AWREADY && S_AXI_AWVALID && S_AXI_WVALID) begin
             S_AXI_AWREADY <= 1'b1;
@@ -84,13 +92,16 @@ always @(posedge S_AXI_ACLK) begin
             S_AXI_WREADY <= 1'b0;
 
         if (S_AXI_AWREADY && S_AXI_AWVALID && S_AXI_WREADY && S_AXI_WVALID) begin
-            case (axi_awaddr[5:2])
-                4'd0: ton_cycles  <= S_AXI_WDATA;
-                4'd1: toff_cycles <= S_AXI_WDATA;
-                4'd2: enable      <= S_AXI_WDATA[0];
-                4'd5: capture_len <= S_AXI_WDATA[15:0];
-                default: ;
-            endcase
+            // Only control registers are writable (address < 0x800)
+            if (!axi_awaddr[11]) begin
+                case (axi_awaddr[5:2])
+                    4'd0: ton_cycles  <= S_AXI_WDATA;
+                    4'd1: toff_cycles <= S_AXI_WDATA;
+                    4'd2: enable      <= S_AXI_WDATA[0];
+                    4'd5: capture_len <= S_AXI_WDATA[15:0];
+                    default: ;
+                endcase
+            end
         end
 
         if (S_AXI_AWREADY && S_AXI_AWVALID && S_AXI_WREADY && S_AXI_WVALID && !S_AXI_BVALID) begin
@@ -118,19 +129,26 @@ always @(posedge S_AXI_ACLK) begin
         if (S_AXI_ARREADY && S_AXI_ARVALID && !S_AXI_RVALID) begin
             S_AXI_RVALID <= 1'b1;
             S_AXI_RRESP  <= 2'b00;
-            case (axi_araddr[5:2])
-                4'd0:  S_AXI_RDATA <= ton_cycles;
-                4'd1:  S_AXI_RDATA <= toff_cycles;
-                4'd2:  S_AXI_RDATA <= {31'd0, enable};
-                4'd3:  S_AXI_RDATA <= pulse_count;
-                4'd4:  S_AXI_RDATA <= {31'd0, hv_enable_in};
-                4'd5:  S_AXI_RDATA <= {16'd0, capture_len};
-                4'd6:  S_AXI_RDATA <= waveform_count;
-                4'd7:  S_AXI_RDATA <= {20'd0, xadc_ch1_raw};
-                4'd8:  S_AXI_RDATA <= {20'd0, xadc_ch2_raw};
-                4'd9:  S_AXI_RDATA <= {20'd0, xadc_temp_raw};
-                default: S_AXI_RDATA <= 32'd0;
-            endcase
+
+            if (axi_araddr[11]) begin
+                // Address >= 0x800: waveform BRAM data
+                S_AXI_RDATA <= bram_rd_data;
+            end else begin
+                // Address < 0x800: control/status registers
+                case (axi_araddr[5:2])
+                    4'd0:  S_AXI_RDATA <= ton_cycles;
+                    4'd1:  S_AXI_RDATA <= toff_cycles;
+                    4'd2:  S_AXI_RDATA <= {31'd0, enable};
+                    4'd3:  S_AXI_RDATA <= pulse_count;
+                    4'd4:  S_AXI_RDATA <= {31'd0, hv_enable_in};
+                    4'd5:  S_AXI_RDATA <= {16'd0, capture_len};
+                    4'd6:  S_AXI_RDATA <= waveform_count;
+                    4'd7:  S_AXI_RDATA <= {20'd0, xadc_ch1_raw};
+                    4'd8:  S_AXI_RDATA <= {20'd0, xadc_ch2_raw};
+                    4'd9:  S_AXI_RDATA <= {20'd0, xadc_temp_raw};
+                    default: S_AXI_RDATA <= 32'd0;
+                endcase
+            end
         end else if (S_AXI_RVALID && S_AXI_RREADY)
             S_AXI_RVALID <= 1'b0;
     end

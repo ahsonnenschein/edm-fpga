@@ -1,5 +1,5 @@
 ﻿<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
-<EDKSYSTEM EDWVERSION="1.2" TIMESTAMP="Tue Mar 31 08:24:19 2026" VIVADOVERSION="2023.2">
+<EDKSYSTEM EDWVERSION="1.2" TIMESTAMP="Tue Mar 31 09:24:48 2026" VIVADOVERSION="2023.2">
 
   <SYSTEMINFO ARCH="zynq" DEVICE="7z020" NAME="edm_system" PACKAGE="clg400" SPEEDGRADE="-1"/>
 
@@ -69,7 +69,7 @@
         <CONNECTION INSTANCE="ps7" PORT="DDR_RAS_n"/>
       </CONNECTIONS>
     </PORT>
-    <PORT DIR="IO" NAME="DDR_reset_n" SIGIS="rst" SIGNAME="ps7_DDR_DRSTB">
+    <PORT DIR="IO" NAME="DDR_reset_n" POLARITY="ACTIVE_LOW" SIGIS="rst" SIGNAME="ps7_DDR_DRSTB">
       <CONNECTIONS>
         <CONNECTION INSTANCE="ps7" PORT="DDR_DRSTB"/>
       </CONNECTIONS>
@@ -1420,7 +1420,7 @@
             <PORTMAP LOGICAL="WVALID" PHYSICAL="m_axi_s2mm_wvalid"/>
           </PORTMAPS>
         </BUSINTERFACE>
-        <BUSINTERFACE BUSNAME="edm_ctrl_M_AXIS" NAME="S_AXIS_S2MM" TYPE="TARGET" VLNV="xilinx.com:interface:axis:1.0">
+        <BUSINTERFACE BUSNAME="edm_ctrl_m_axis" NAME="S_AXIS_S2MM" TYPE="TARGET" VLNV="xilinx.com:interface:axis:1.0">
           <PARAMETER NAME="CLK_DOMAIN" VALUE="edm_system_ps7_0_FCLK_CLK0"/>
           <PARAMETER NAME="FREQ_HZ" VALUE="100000000"/>
           <PARAMETER NAME="HAS_TKEEP" VALUE="1"/>
@@ -2628,10 +2628,10 @@
     <MODULE COREREVISION="1" FULLNAME="/edm_ctrl" HWVERSION="1.0" INSTANCE="edm_ctrl" IPTYPE="PERIPHERAL" IS_ENABLE="1" MODCLASS="PERIPHERAL" MODTYPE="edm_top" VLNV="xilinx.com:module_ref:edm_top:1.0">
       <DOCUMENTS/>
       <ADDRESSBLOCKS>
-        <ADDRESSBLOCK ACCESS="" INTERFACE="S_AXI" NAME="reg0" RANGE="4096" USAGE="register"/>
+        <ADDRESSBLOCK ACCESS="" INTERFACE="S_AXI" NAME="reg0" RANGE="0x1000" USAGE="register"/>
       </ADDRESSBLOCKS>
       <PARAMETERS>
-        <PARAMETER NAME="C_S_AXI_ADDR_WIDTH" VALUE="6"/>
+        <PARAMETER NAME="C_S_AXI_ADDR_WIDTH" VALUE="12"/>
         <PARAMETER NAME="C_S_AXI_DATA_WIDTH" VALUE="32"/>
         <PARAMETER NAME="Component_Name" VALUE="edm_system_edm_ctrl_0"/>
         <PARAMETER NAME="EDK_IPTYPE" VALUE="PERIPHERAL"/>
@@ -2644,7 +2644,7 @@
             <CONNECTION INSTANCE="ps7" PORT="FCLK_CLK0"/>
           </CONNECTIONS>
         </PORT>
-        <PORT DIR="I" LEFT="5" NAME="S_AXI_ARADDR" RIGHT="0" SIGIS="undef" SIGNAME="axi_gp0_M00_AXI_araddr">
+        <PORT DIR="I" LEFT="11" NAME="S_AXI_ARADDR" RIGHT="0" SIGIS="undef" SIGNAME="axi_gp0_M00_AXI_araddr">
           <CONNECTIONS>
             <CONNECTION INSTANCE="axi_gp0" PORT="M00_AXI_araddr"/>
           </CONNECTIONS>
@@ -2669,7 +2669,7 @@
             <CONNECTION INSTANCE="axi_gp0" PORT="M00_AXI_arvalid"/>
           </CONNECTIONS>
         </PORT>
-        <PORT DIR="I" LEFT="5" NAME="S_AXI_AWADDR" RIGHT="0" SIGIS="undef" SIGNAME="axi_gp0_M00_AXI_awaddr">
+        <PORT DIR="I" LEFT="11" NAME="S_AXI_AWADDR" RIGHT="0" SIGIS="undef" SIGNAME="axi_gp0_M00_AXI_awaddr">
           <CONNECTIONS>
             <CONNECTION INSTANCE="axi_gp0" PORT="M00_AXI_awaddr"/>
           </CONNECTIONS>
@@ -2826,8 +2826,8 @@
         </PORT>
       </PORTS>
       <BUSINTERFACES>
-        <BUSINTERFACE BUSNAME="edm_ctrl_M_AXIS" NAME="M_AXIS" TYPE="INITIATOR" VLNV="xilinx.com:interface:axis:1.0">
-          <PARAMETER NAME="CLK_DOMAIN" VALUE="edm_system_ps7_0_FCLK_CLK0"/>
+        <BUSINTERFACE BUSNAME="edm_ctrl_m_axis" NAME="m_axis" TYPE="INITIATOR" VLNV="xilinx.com:interface:axis:1.0">
+          <PARAMETER NAME="CLK_DOMAIN"/>
           <PARAMETER NAME="FREQ_HZ" VALUE="100000000"/>
           <PARAMETER NAME="HAS_TKEEP" VALUE="0"/>
           <PARAMETER NAME="HAS_TLAST" VALUE="1"/>
@@ -2848,7 +2848,7 @@
           </PORTMAPS>
         </BUSINTERFACE>
         <BUSINTERFACE BUSNAME="axi_gp0_M00_AXI" DATAWIDTH="32" NAME="S_AXI" TYPE="SLAVE" VLNV="xilinx.com:interface:aximm:1.0">
-          <PARAMETER NAME="ADDR_WIDTH" VALUE="6"/>
+          <PARAMETER NAME="ADDR_WIDTH" VALUE="12"/>
           <PARAMETER NAME="ARUSER_WIDTH" VALUE="0"/>
           <PARAMETER NAME="AWUSER_WIDTH" VALUE="0"/>
           <PARAMETER NAME="BUSER_WIDTH" VALUE="0"/>
@@ -2907,9 +2907,6 @@
       <DOCUMENTS>
         <DOCUMENT SOURCE="http://www.xilinx.com/cgi-bin/docs/ipdoc?c=processing_system7;v=v5_3;d=pg082-processing-system7.pdf"/>
       </DOCUMENTS>
-      <ADDRESSBLOCKS>
-        <ADDRESSBLOCK ACCESS="" INTERFACE="S_AXI_HP0" NAME="HP0_DDR_LOWOCM" RANGE="536870912" USAGE="memory"/>
-      </ADDRESSBLOCKS>
       <PARAMETERS>
         <PARAMETER NAME="C_DM_WIDTH" VALUE="4"/>
         <PARAMETER NAME="C_DQS_WIDTH" VALUE="4"/>

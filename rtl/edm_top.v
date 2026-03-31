@@ -9,7 +9,7 @@
 
 module edm_top #(
     parameter C_S_AXI_DATA_WIDTH = 32,
-    parameter C_S_AXI_ADDR_WIDTH = 6
+    parameter C_S_AXI_ADDR_WIDTH = 12   // 4KB: control regs + waveform BRAM
 )(
     // AXI4-Lite slave
     input  wire                             S_AXI_ACLK,
@@ -73,6 +73,10 @@ wire        pulse_internal;
 wire [11:0] xadc_ch1_raw, xadc_ch2_raw, xadc_temp_raw;
 wire        pair_ready;
 
+// BRAM read port (register file ↔ waveform capture)
+wire [8:0]  bram_rd_addr;
+wire [31:0] bram_rd_data;
+
 // ── 2-FF synchroniser for HV enable ───────────────────
 reg hv_enable_r1, hv_enable_sync;
 always @(posedge S_AXI_ACLK) begin
@@ -121,7 +125,9 @@ axi_edm_regs #(
     .waveform_count  (waveform_count),
     .xadc_ch1_raw    (xadc_ch1_raw),
     .xadc_ch2_raw    (xadc_ch2_raw),
-    .xadc_temp_raw   (xadc_temp_raw)
+    .xadc_temp_raw   (xadc_temp_raw),
+    .bram_rd_addr    (bram_rd_addr),
+    .bram_rd_data    (bram_rd_data)
 );
 
 // ── EDM pulse state machine ────────────────────────────
@@ -151,6 +157,8 @@ waveform_capture u_cap (
     .m_axis_tvalid  (m_axis_tvalid),
     .m_axis_tlast   (m_axis_tlast),
     .m_axis_tready  (m_axis_tready),
+    .bram_rd_addr   (bram_rd_addr),
+    .bram_rd_data   (bram_rd_data),
     .capturing      (),
     .waveform_count (waveform_count)
 );
