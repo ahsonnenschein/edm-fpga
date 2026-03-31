@@ -153,7 +153,7 @@ class WaveformWidget(QWidget):
         self._prescale = 1
         self._ton_us   = 10
         self._toff_us  = 90
-        self._burst_history = deque(maxlen=10)   # last 10 (t_us, ch1, ch2) bursts
+        self._burst_history = deque(maxlen=20)   # last 20 bursts overlaid
 
         self.fig = Figure(figsize=(7, 4), tight_layout=True)
         self.fig.patch.set_facecolor('#1e1e1e')
@@ -297,8 +297,9 @@ class WaveformWidget(QWidget):
 
         x_max = 1.0
         for i, (t, ch1, ch2, pulse) in enumerate(history):
-            alpha = 0.15 + 0.85 * (i + 1) / nb
-            lw    = 0.5  + 0.6  * (i + 1) / nb
+            frac  = (i + 1) / nb          # 0→1 from oldest to newest
+            alpha = 0.05 + 0.95 * frac**2  # quadratic: old traces very dim
+            lw    = 0.3  + 0.9  * frac
             # Show dots at each sample so zero-valued samples are visible
             ms = 5.0 if len(t) <= 200 else 0   # skip dots for very long captures
             self.ax1.plot(t, ch1, color='#2196F3', alpha=alpha, lw=lw,
@@ -322,7 +323,7 @@ class WaveformWidget(QWidget):
         self.ax2.set_xlabel("Time in pulse (µs)",    color='#cccccc', fontsize=8)
         n_samp = len(history[-1][0])
         self.ax1.set_title(
-            f"CH1 – Arc Current  [last {nb} pulses overlaid, {n_samp} samples @ 500 kSPS]",
+            f"CH1 – Arc Current  [last {nb} pulses overlaid, {n_samp} samples @ 480 kSPS]",
             color='#cccccc', fontsize=9)
         self.ax2.set_title("CH2 – Gap Voltage", color='#cccccc', fontsize=9)
         self.canvas.draw_idle()
