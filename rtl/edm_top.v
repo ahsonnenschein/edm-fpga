@@ -77,6 +77,13 @@ wire        pair_ready;
 wire [8:0]  bram_rd_addr;
 wire [31:0] bram_rd_data;
 
+// Gap voltage accumulator (per-pulse average during Ton)
+reg [31:0] gap_sum;         // running sum of ch2 samples during Ton
+reg [15:0] gap_count;       // number of samples accumulated
+reg [31:0] gap_sum_lat;     // latched at Ton→Toff edge
+reg [15:0] gap_count_lat;   // latched at Ton→Toff edge
+reg        pulse_out_prev;  // for edge detection
+
 // ── 2-FF synchroniser for HV enable ───────────────────
 reg hv_enable_r1, hv_enable_sync;
 always @(posedge S_AXI_ACLK) begin
@@ -126,6 +133,8 @@ axi_edm_regs #(
     .xadc_ch1_raw    (xadc_ch1_raw),
     .xadc_ch2_raw    (xadc_ch2_raw),
     .xadc_temp_raw   (xadc_temp_raw),
+    .gap_sum         (gap_sum_lat),
+    .gap_count       (gap_count_lat),
     .bram_rd_addr    (bram_rd_addr),
     .bram_rd_data    (bram_rd_data)
 );
@@ -142,6 +151,34 @@ edm_pulse_ctrl u_pulse (
     .trigger     (pulse_trigger),
     .pulse_count (pulse_count)
 );
+
+// ── Gap voltage accumulator (per-pulse Ton average) ────
+// Accumulates ch2 (gap voltage) samples during Ton via pair_ready.
+// At the Ton→Toff falling edge, latches sum and count for software.
+always @(posedge S_AXI_ACLK) begin
+    if (!S_AXI_ARESETN) begin
+        gap_sum       <= 32'd0;
+        gap_count     <= 16'd0;
+        gap_sum_lat   <= 32'd0;
+        gap_count_lat <= 16'd0;
+        pulse_out_prev <= 1'b0;
+    end else begin
+        pulse_out_prev <= pulse_out;
+
+        // Falling edge of pulse_out: latch and reset
+        if (pulse_out_prev && !pulse_out) begin
+            gap_sum_lat   <= gap_sum;
+            gap_count_lat <= gap_count;
+            gap_sum       <= 32'd0;
+            gap_count     <= 16'd0;
+        end
+        // Accumulate during Ton
+        else if (pulse_out && pair_ready) begin
+            gap_sum   <= gap_sum + {20'd0, xadc_ch2_raw};
+            gap_count <= gap_count + 16'd1;
+        end
+    end
+end
 
 // ── Per-pulse waveform capture ─────────────────────────
 waveform_capture u_cap (

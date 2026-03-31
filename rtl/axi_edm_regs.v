@@ -13,6 +13,8 @@
 //   0x01C  xadc_ch1_raw    RO  Latest CH1 12-bit value
 //   0x020  xadc_ch2_raw    RO  Latest CH2 12-bit value
 //   0x024  xadc_temp_raw   RO  Latest temperature 12-bit value
+//   0x028  gap_sum         RO  Sum of CH2 samples during last Ton
+//   0x02C  gap_count       RO  Number of CH2 samples in gap_sum
 //   0x800-0xFFC  waveform BRAM  RO  Captured samples (up to 512 words)
 
 module axi_edm_regs #(
@@ -56,6 +58,10 @@ module axi_edm_regs #(
     input  wire [11:0] xadc_ch1_raw,
     input  wire [11:0] xadc_ch2_raw,
     input  wire [11:0] xadc_temp_raw,
+
+    // Gap voltage accumulator (per-pulse average during Ton)
+    input  wire [31:0] gap_sum,
+    input  wire [15:0] gap_count,
 
     // Waveform BRAM read port
     output wire [8:0]  bram_rd_addr,
@@ -146,6 +152,8 @@ always @(posedge S_AXI_ACLK) begin
                     4'd7:  S_AXI_RDATA <= {20'd0, xadc_ch1_raw};
                     4'd8:  S_AXI_RDATA <= {20'd0, xadc_ch2_raw};
                     4'd9:  S_AXI_RDATA <= {20'd0, xadc_temp_raw};
+                    4'd10: S_AXI_RDATA <= gap_sum;
+                    4'd11: S_AXI_RDATA <= {16'd0, gap_count};
                     default: S_AXI_RDATA <= 32'd0;
                 endcase
             end

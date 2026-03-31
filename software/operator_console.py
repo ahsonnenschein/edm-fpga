@@ -166,7 +166,7 @@ class WaveformWidget(QWidget):
             for spine in ax.spines.values():
                 spine.set_edgecolor('#444444')
 
-        self.ax1.set_ylabel("Arc Current (V)", color='#cccccc', fontsize=8)
+        self.ax1.set_ylabel("Arc Current (A)", color='#cccccc', fontsize=8)
         self.ax1.margins(y=0.12)
         self.ax1.yaxis.label.set_color('#cccccc')
 
@@ -318,7 +318,7 @@ class WaveformWidget(QWidget):
         self.ax2.set_xlim(0, x_max)
         self.ax1.margins(y=0.12); self.ax1.autoscale_view(scalex=False)
         self.ax2.margins(y=0.12); self.ax2.autoscale_view(scalex=False)
-        self.ax1.set_ylabel("Arc Current (V)",  color='#cccccc', fontsize=8)
+        self.ax1.set_ylabel("Arc Current (A)",  color='#cccccc', fontsize=8)
         self.ax2.set_ylabel("Gap Voltage (V)",  color='#cccccc', fontsize=8)
         self.ax2.set_xlabel("Time in pulse (µs)",    color='#cccccc', fontsize=8)
         n_samp = len(history[-1][0])
@@ -432,13 +432,13 @@ class StatsWidget(QGroupBox):
 # 1-minute voltage/current histogram
 # ─────────────────────────────────────────────────────────────────────────────
 class HistogramWidget(QWidget):
-    """Rolling 1-minute histogram of arc current (CH1) and gap voltage (CH2)."""
+    """Rolling histogram of per-pulse gap voltage average (from PL accumulator)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._buf_ch1 = deque(maxlen=HIST_BUF_MAX)
-        self._buf_ch2 = deque(maxlen=HIST_BUF_MAX)
-        self._has_burst_data = False
+        self._buf_gap = deque(maxlen=10_000)   # 10K entries = ~1s at 10 kHz pulse rate
+        self._buf_ch1 = deque(maxlen=10_000)
+        self._last_pc = 0                       # track pulse_count for new entries
 
         self.fig = Figure(figsize=(7, 2.2), tight_layout=True)
         self.fig.patch.set_facecolor('#1e1e1e')
@@ -456,29 +456,27 @@ class HistogramWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.canvas)
 
-    def add_sample(self, ch1: float, ch2: float):
-        if not self._has_burst_data:
-            self._buf_ch1.append(ch1)
-            self._buf_ch2.append(ch2)
+    def add_status(self, status: dict):
+        """Called at 200 Hz from status stream. Adds gap_avg if pulse advanced."""
+        gap_avg = status.get('gap_avg')
+        pc = status.get('pulse_count', 0)
+        if gap_avg is not None and pc != self._last_pc and gap_avg > 0:
+            self._buf_gap.append(gap_avg)
+            self._last_pc = pc
 
     def add_burst(self, ch1_arr: np.ndarray, ch2_arr: np.ndarray):
-        """Add the per-pulse mean of a DMA burst (one point per pulse)."""
+        """Add per-pulse current from burst waveform."""
         if len(ch1_arr):
-            self._has_burst_data = True
-            self._buf_ch1.append(float(np.mean(ch1_arr)))
-            self._buf_ch2.append(float(np.mean(ch2_arr)))
+            active = ch1_arr[ch1_arr > 0.01]
+            if len(active):
+                self._buf_ch1.append(float(np.mean(active)))
 
     def refresh(self):
-        if len(self._buf_ch1) < 2:
-            return
-        ch1 = np.array(self._buf_ch1, dtype=np.float32)
-        ch2 = np.array(self._buf_ch2, dtype=np.float32)
-        n   = len(ch1)
-        secs = min(n / 200, 60)
-
-        for ax, data, color, label, chan in [
-            (self.ax1, ch1, '#2196F3', 'Arc Current (V)',   'CH1'),
-            (self.ax2, ch2, '#F44336', 'Gap Voltage (V)',  'CH2'),
+        for ax, buf, color, label, title in [
+            (self.ax1, self._buf_ch1, '#2196F3', 'Arc Current (A)',
+             'CH1 – Ton Current'),
+            (self.ax2, self._buf_gap, '#F44336', 'Gap Voltage (V)',
+             'Gap Avg (PL, per-pulse)'),
         ]:
             ax.cla()
             ax.set_facecolor('#1e1e1e')
@@ -486,12 +484,16 @@ class HistogramWidget(QWidget):
             ax.grid(True, color='#333333', linewidth=0.5, axis='y')
             for spine in ax.spines.values():
                 spine.set_edgecolor('#444444')
-            ax.set_xlabel(label, color='#cccccc', fontsize=8)
-            src = "per-pulse avg" if self._has_burst_data else "200 Hz samples"
-            ax.set_title(
-                f"{chan} histogram  ({secs:.0f} s, {n} pulses, {src})",
-                color='#cccccc', fontsize=9)
-            ax.hist(data, bins=60, color=color, alpha=0.85, edgecolor='none')
+            n = len(buf)
+            if n >= 2:
+                data = np.array(buf, dtype=np.float32)
+                ax.hist(data, bins=60, color=color, alpha=0.85, edgecolor='none')
+                ax.set_xlabel(label, color='#cccccc', fontsize=8)
+                ax.set_title(f"{title}  ({n} pulses)",
+                             color='#cccccc', fontsize=9)
+            else:
+                ax.set_title(f"{title}  (waiting...)",
+                             color='#cccccc', fontsize=9)
             ax.yaxis.label.set_color('#cccccc')
 
         self.canvas.draw_idle()
@@ -733,6 +735,7 @@ class OperatorConsole(QMainWindow):
     def _on_status(self, d: dict):
         self._last_status = d
         self._last_enable = bool(d.get('enable', 0))
+        self._hist_widget.add_status(d)
         self._lbl_pulse.setText(str(d.get('pulse_count', '—')))
 
         hven = d.get('hv_enable')

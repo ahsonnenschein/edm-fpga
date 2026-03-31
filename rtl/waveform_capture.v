@@ -119,7 +119,7 @@ always @(posedge clk or negedge rst_n) begin
             end
 
             S_CAPTURE: begin
-                if (sample_tick && samples_stored < cap_len_lat) begin
+                if (pair_ready && samples_stored < cap_len_lat) begin
                     bram[wr_addr] <= {ch1_data, ch2_data, pulse_state};
                     wr_addr        <= wr_addr + 1;
                     samples_stored <= samples_stored + 16'd1;

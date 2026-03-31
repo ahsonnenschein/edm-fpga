@@ -32,13 +32,15 @@ REG_WAVEFORM_CNT  = 0x18
 REG_XADC_CH1      = 0x1C
 REG_XADC_CH2      = 0x20
 REG_XADC_TEMP     = 0x24
+REG_GAP_SUM       = 0x28
+REG_GAP_COUNT     = 0x2C
 
 # Waveform BRAM base offset (within the same AXI-Lite slave)
 BRAM_BASE         = 0x800   # samples at 0x800, 0x804, ..., 0xFFC (512 max)
 
 CH1_DIVIDER = 1.0
-CH1_PROBE   = 50.0
-CH2_RANGE   = 4.95
+CH1_PROBE   = 3.333    # calibrated: 2A reads as 2.0 (was 50.0 for voltage probe)
+CH2_RANGE   = 198.0   # calibrated: 20V gap reads as 20.0 (÷5 on-board + XADC scaling)
 MAX_CAPTURE = 512
 
 
@@ -168,9 +170,15 @@ class EdmServer:
                     self._psu_status_iter = 0
                     try: self._psu_vout, self._psu_iout = self._psu.read_output()
                     except: pass
+                # Per-pulse gap voltage average (computed in PL)
+                gap_sum = self._edm.read(REG_GAP_SUM)
+                gap_count = self._edm.read(REG_GAP_COUNT) & 0xFFFF
+                gap_avg_v = (gap_sum / gap_count / 4096 * CH2_RANGE) if gap_count > 0 else 0.0
+
                 d = {'type':'status','ts':round(t0,4),'ch1':round(ch1,4),
                      'ch2':round(ch2,4),'temp':round(temp,1),'pulse_count':pc,
-                     'hv_enable':hv,'enable':en,'psu_ok':self._psu is not None}
+                     'hv_enable':hv,'enable':en,'psu_ok':self._psu is not None,
+                     'gap_avg':round(gap_avg_v, 2)}
                 if self._psu_vout is not None:
                     d['psu_vout']=round(self._psu_vout,2)
                     d['psu_iout']=round(self._psu_iout,3)
