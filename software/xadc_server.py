@@ -186,11 +186,28 @@ class EdmServer:
         self._clients = []
         self._running = True
 
-        # Load overlay — PYNQ claims the DMA via its driver.
-        # We use transfer() to start DMA, then poll for completion via
-        # the PYNQ DMA object's register access (no interrupt needed).
-        print(f"Loading overlay: {OVERLAY_BIT}")
-        self._ol = Overlay(OVERLAY_BIT)
+        # Load overlay using a MODIFIED HWH that hides the DMA IP from PYNQ.
+        # PYNQ's DMA driver claims exclusive ownership via UIO, blocking raw
+        # MMIO access.  By renaming the MODTYPE in the HWH, PYNQ loads the
+        # bitstream but treats the DMA as an unknown IP (DefaultIP), leaving
+        # the registers accessible via raw MMIO for polling-based control.
+        import shutil
+        _hwh_mod = OVERLAY_BIT.replace('.bit', '_nodma.hwh')
+        _hwh_orig = OVERLAY_BIT.replace('.bit', '.hwh')
+        if os.path.exists(_hwh_mod):
+            # Use the modified HWH — temporarily swap it in
+            _hwh_bak = _hwh_orig + '.bak'
+            shutil.copy(_hwh_orig, _hwh_bak)
+            shutil.copy(_hwh_mod, _hwh_orig)
+            print(f"Loading overlay: {OVERLAY_BIT} (DMA hidden from PYNQ)")
+            try:
+                Overlay(OVERLAY_BIT)
+            finally:
+                shutil.copy(_hwh_bak, _hwh_orig)
+                os.remove(_hwh_bak)
+        else:
+            print(f"Loading overlay: {OVERLAY_BIT}")
+            Overlay(OVERLAY_BIT)
         time.sleep(1)
         print("Overlay loaded.")
 
@@ -204,14 +221,21 @@ class EdmServer:
             print(f"FCLK_CLK0 = {actual:.1f} MHz (OK)")
 
         self._edm = MMIO(EDM_BASE, 0x28)
-        self._pynq_dma = self._ol.axi_dma_0
+        self._dma = MMIO(DMA_BASE, 0x100)
 
-        self._capture_len = 100
-        self._buf = allocate(shape=(self._capture_len * 2,), dtype=np.uint32)
-        print(f"DMA buffer: {self._capture_len} samples, {len(self._buf)*4} bytes")
+        self._buf = allocate(shape=(MAX_CAPTURE * 2,), dtype=np.uint32)
+        self._buf_phys = self._buf.physical_address
+        print(f"DMA buffer: phys=0x{self._buf_phys:08X}, {MAX_CAPTURE} words")
 
-        self._edm.write(REG_CAPTURE_LEN, self._capture_len)
-        print(f"Capture length set to {self._capture_len} samples")
+        self._edm.write(REG_CAPTURE_LEN, 100)
+        print("Capture length set to 100 samples")
+
+        # Reset and start DMA engine
+        self._dma.write(DMA_S2MM_CONTROL, 0x0004)
+        time.sleep(0.01)
+        self._dma.write(DMA_S2MM_CONTROL, 0x0001)
+        st = self._dma.read(DMA_S2MM_STATUS)
+        print(f"DMA initialized: status=0x{st:04X}")
 
         # PSU on Pmod B UART (MMIO access to PS UART1)
         self._psu      = None
@@ -287,6 +311,13 @@ class EdmServer:
 
     # ── Per-pulse DMA waveform capture ────────────────────────────────────────
 
+    _DMA_HALTED  = 0x0001
+    _DMA_IDLE    = 0x0002
+    _DMA_DMAERR  = 0x0010
+    _DMA_SLVERR  = 0x0020
+    _DMA_DECERR  = 0x0040
+    _DMA_IOC_IRQ = 0x1000
+
     def _dma_loop(self):
         """
         Uses PYNQ DMA driver's transfer() to arm the DMA, then polls
@@ -301,26 +332,44 @@ class EdmServer:
                 capture_len = max(1, min(
                     self._edm.read(REG_CAPTURE_LEN) & 0xFFFF, MAX_CAPTURE
                 ))
-                if capture_len != self._capture_len:
-                    self._capture_len = capture_len
+                if False:  # buffer reallocation not needed for raw MMIO mode
+                    pass
                     self._buf = allocate(shape=(capture_len * 2,), dtype=np.uint32)
                     print(f"DMA buffer reallocated: {capture_len} samples, {len(self._buf)*4} bytes")
 
-                # Use PYNQ to start the DMA transfer
-                self._pynq_dma.recvchannel.transfer(self._buf)
+                # Arm DMA via raw MMIO (PYNQ driver hidden)
+                st_before = self._dma.read(DMA_S2MM_STATUS)
+                if st_before & self._DMA_HALTED:
+                    self._dma.write(DMA_S2MM_CONTROL, 0x0004)
+                    time.sleep(0.002)
+                    self._dma.write(DMA_S2MM_CONTROL, 0x0001)
+                    time.sleep(0.001)
+                self._dma.write(DMA_S2MM_STATUS, 0x7000)
+                self._dma.write(DMA_S2MM_DST_ADDR, self._buf_phys & 0xFFFFFFFF)
+                self._dma.write(DMA_S2MM_LENGTH, capture_len * 8)
 
-                # Poll for completion instead of wait() (which needs interrupt)
+                if _dbg_ok == 0 and (_dbg_iter := getattr(self, '_dbg_iter', 0) + 1) <= 5:
+                    self._dbg_iter = _dbg_iter
+                    st_after = self._dma.read(DMA_S2MM_STATUS)
+                    print(f"DMA arm #{_dbg_iter}: before=0x{st_before:04X} after=0x{st_after:04X} cap={capture_len}")
+
+                # Poll for completion, max 5s
                 deadline = time.time() + 5.0
                 done = False
                 while time.time() < deadline:
-                    if self._pynq_dma.recvchannel.idle:
+                    st = self._dma.read(DMA_S2MM_STATUS)
+                    if st & (self._DMA_IDLE | self._DMA_IOC_IRQ):
                         done = True
+                        break
+                    if st & (self._DMA_DMAERR | self._DMA_SLVERR | self._DMA_DECERR):
+                        print(f"DMA error: status=0x{st:04X}")
                         break
                     time.sleep(0.0001)
 
                 if not done:
-                    if _dbg_ok == 0:
-                        print("DMA timeout — no TLAST received")
+                    self._dma.write(DMA_S2MM_CONTROL, 0x0004)
+                    time.sleep(0.01)
+                    self._dma.write(DMA_S2MM_CONTROL, 0x0001)
                     continue
 
                 wf_count = self._edm.read(REG_WAVEFORM_CNT)
