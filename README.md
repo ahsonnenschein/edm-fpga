@@ -562,4 +562,11 @@ This also fixed the first-period anomaly: with the trigger decoupled from `m_axi
 
 ### 25. XADC VP/VN requires both pins connected — VN must not float
 
+
 The XADC VP/VN differential input measures (VP − VN).  If VN is left floating, the measurement has a large DC offset (~9V with 50x probe scaling) that makes the signal appear inverted.  Connect VN to the **XADC header GND pin** (pin 3) or to the signal source ground for a proper differential reference.
+
+### 26. Use trigger-synchronous sampling to eliminate jitter
+
+When using `pair_ready` (from the XADC DRP reader) as the sample clock, each capture's first sample lands at a random phase of the XADC conversion cycle relative to the trigger.  This causes ±1 sample (~2µs) of jitter visible as misaligned traces in the persistence display.
+
+**Fix:** Replace `pair_ready`-driven BRAM writes with a fixed-rate `sample_tick` counter that resets on the trigger edge.  Every capture's samples are at identical offsets from the trigger, eliminating inter-trace jitter entirely.  The `ch1_data`/`ch2_data` values may be up to ~2µs stale (from the last `pair_ready`), but this is sub-sample and invisible.

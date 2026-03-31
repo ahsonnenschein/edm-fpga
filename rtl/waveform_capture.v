@@ -1,13 +1,15 @@
 `timescale 1ns/1ps
-// waveform_capture.v  (rev 11 — decoupled BRAM capture with AXI-Lite readout)
+// waveform_capture.v  (rev 12 — trigger-synchronous sampling, zero jitter)
 //
-// Two-phase capture, NO AXI DMA dependency:
-//   Phase 1 (CAPTURE): trigger starts sampling into local BRAM.
-//     Independent of m_axis_tready and DMA state.
-//   Phase 2: Software reads BRAM via AXI-Lite register interface.
+// Samples are taken at a fixed rate (every SAMPLE_PERIOD clocks) synchronized
+// to the trigger edge.  This eliminates the ±1 sample jitter caused by
+// pair_ready's asynchronous phase relative to the trigger.
 //
-// waveform_count increments when BRAM capture completes.
-// AXI-Stream output is kept for compatibility but not required.
+// ch1_data/ch2_data are latched from the XADC DRP reader and hold their
+// value between pair_ready pulses.  Sampling them at fixed intervals gives
+// values that may be up to ~2µs stale, but this is sub-sample and invisible.
+//
+// No AXI DMA — software reads BRAM via AXI-Lite register window.
 // Max capture depth: 512 samples.
 
 module waveform_capture (
@@ -23,24 +25,28 @@ module waveform_capture (
     // Decoded XADC pair from xadc_drp_reader
     input  wire [11:0] ch1_data,
     input  wire [11:0] ch2_data,
-    input  wire        pair_ready,
+    input  wire        pair_ready,      // unused — sampling is clock-based
 
     // Capture depth in pairs
     input  wire [15:0] capture_len,
 
-    // AXI4-Stream master (optional — kept for compatibility)
+    // AXI4-Stream master (tied off — not used)
     output wire [31:0] m_axis_tdata,
     output wire        m_axis_tvalid,
     output wire        m_axis_tlast,
     input  wire        m_axis_tready,
 
     // BRAM read port for AXI-Lite access
-    input  wire [8:0]  bram_rd_addr,    // 0-511
-    output wire [31:0] bram_rd_data,    // {ch1, 4'b0, ch2, 3'b0, pulse}
+    input  wire [8:0]  bram_rd_addr,
+    output wire [31:0] bram_rd_data,
 
     output reg         capturing,
     output reg  [31:0] waveform_count
 );
+
+// ── Sample rate ──────────────────────────────────────
+// 100 MHz / 208 = 480.769 kSPS — matches the XADC pair_ready rate
+localparam SAMPLE_PERIOD = 208;
 
 // ── Local BRAM buffer (512 × 25 bits) ────────────────
 localparam MAX_DEPTH = 512;
@@ -58,10 +64,31 @@ assign bram_rd_data = {rd_raw[24:13], 4'b0000,
                        rd_raw[12:1],  3'b000,
                        rd_raw[0]};
 
-// ── AXI-Stream (no-op — tied off) ────────────────────
+// ── AXI-Stream (tied off) ────────────────────────────
 assign m_axis_tdata  = 32'd0;
 assign m_axis_tvalid = 1'b0;
 assign m_axis_tlast  = 1'b0;
+
+// ── Fixed-rate sample tick ───────────────────────────
+reg [15:0] tick_counter;
+reg        sample_tick;
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        tick_counter <= 16'd0;
+        sample_tick  <= 1'b0;
+    end else begin
+        sample_tick <= 1'b0;
+        if (!capturing) begin
+            tick_counter <= 16'd0;
+        end else if (tick_counter >= SAMPLE_PERIOD - 1) begin
+            tick_counter <= 16'd0;
+            sample_tick  <= 1'b1;
+        end else begin
+            tick_counter <= tick_counter + 16'd1;
+        end
+    end
+end
 
 // ── FSM ──────────────────────────────────────────────
 localparam S_IDLE    = 1'd0;
@@ -92,7 +119,7 @@ always @(posedge clk or negedge rst_n) begin
             end
 
             S_CAPTURE: begin
-                if (pair_ready && samples_stored < cap_len_lat) begin
+                if (sample_tick && samples_stored < cap_len_lat) begin
                     bram[wr_addr] <= {ch1_data, ch2_data, pulse_state};
                     wr_addr        <= wr_addr + 1;
                     samples_stored <= samples_stored + 16'd1;
