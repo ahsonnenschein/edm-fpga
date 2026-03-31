@@ -748,7 +748,6 @@ class OperatorConsole(QMainWindow):
 
     def _on_sample(self, ch1: float, ch2: float, ts: float):
         self._wave_widget.add_sample(ch1, ch2, ts, self._last_enable)
-        self._hist_widget.add_sample(ch1, ch2)
 
     def _on_burst(self, ch1_list, ch2_list, pulse_list):
         self._burst_rx_count = getattr(self, '_burst_rx_count', 0) + 1
