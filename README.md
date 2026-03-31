@@ -3,12 +3,15 @@
 FPGA-based EDM (Electrical Discharge Machining) pulse controller running on the **PYNQ-Z2** (Zynq-7020).
 
 - Generates precise Ton/Toff pulse sequences from the FPGA fabric (PL side)
-- Simultaneous 500 kSPS per channel XADC sampling of gap voltage and arc current
-- Per-pulse waveform burst capture via AXI DMA to DDR
+- Simultaneous 480 kSPS per channel XADC sampling of gap voltage and arc current
+- Per-pulse waveform capture via decoupled BRAM + AXI-Lite readout (no DMA)
+- Per-pulse gap voltage averaging in PL for real-time adaptive feed control
+- Adaptive feed parameter AF1 = (Vset − Vavg) / Vavg exposed via Modbus TCP for LinuxCNC
 - Safety interlock: pulse output is gated by an operator HV enable switch
 - Warning lamp outputs (green / orange / red) reflect system state
-- Board-side TCP server streams 200 Hz status frames and per-pulse burst waveforms
-- PC operator console with live waveform overlay, histograms, and DPH8909 PSU control
+- Board-side TCP server streams 200 Hz status, per-pulse waveforms, and gap statistics
+- PC operator console with 50-trace persistence display, histograms, and DPH8909 PSU control
+- Modbus TCP server for LinuxCNC HAL integration (mb2hal)
 
 ---
 
@@ -19,16 +22,16 @@ FPGA-based EDM (Electrical Discharge Machining) pulse controller running on the 
 | Board | PYNQ-Z2 |
 | SoC | Xilinx Zynq-7020 (XC7Z020-1CLG400C) |
 | PL clock | 100 MHz (FCLK0 from PS) |
-| ADC | On-chip XADC, simultaneous sampling, 500 kSPS per channel, 12-bit |
-| CH1 | Arc current — VP/VN dedicated differential input (GEDM current sense) |
-| CH2 | Gap voltage — Hantek HT8050 differential probe → VAUXP6/VAUXN6 (A0/A1) |
+| ADC | On-chip XADC, simultaneous sampling, 480 kSPS per channel, 12-bit |
+| CH1 | Arc current — VP/VN differential input (opto-isolated shunt sense) |
+| CH2 | Gap voltage — VAUXP6/VAUXN6 (A0/A1) via on-board ÷5 divider |
 | Pulse output | Arduino AR0 (T14) → GEDM pulse board |
 | HV enable input | Arduino AR1 (U12) ← operator toggle switch |
 | Green lamp | Arduino AR2 (U13) — HV off |
 | Orange lamp | Arduino AR3 (V13) — HV on, sparks off |
 | Red lamp | Arduino AR4 (V15) — sparks running |
 | Status LEDs | LD0–LD3 (R14, P14, N16, M14) |
-| PSU serial | PYNQ-Z2 Raspberry Pi header pin 8 (TX) / pin 10 (RX) → DPH8909 TTL UART |
+| PSU serial | Pmod B pin 1 (TX, W14) / pin 2 (RX, Y14) → DPH8909 TTL UART via MMIO UART1 |
 
 ---
 
@@ -168,15 +171,30 @@ PL fabric
 | 0x08 | `enable` | RW | bit[0]: 1 = run, 0 = stop |
 | 0x0C | `pulse_count` | RO | Running count of completed pulses |
 | 0x10 | `hv_enable` | RO | bit[0]: operator HV switch state (synchronised) |
-| 0x14 | `capture_len` | RW | Samples to capture per pulse (1–1024, default 500) |
+| 0x14 | `capture_len` | RW | Samples to capture per pulse (1–512, default 100) |
 | 0x18 | `waveform_count` | RO | Count of completed burst captures |
 | 0x1C | `xadc_ch1` | RO | Latest CH1 12-bit raw (latched from DRP reader) |
 | 0x20 | `xadc_ch2` | RO | Latest CH2 12-bit raw |
-| 0x24 | `xadc_temp` | RO | Temperature 12-bit raw (not updated in simultaneous mode) |
+| 0x24 | `xadc_temp` | RO | Temperature 12-bit raw (diagnostic) |
+| 0x28 | `gap_sum` | RO | Sum of CH2 samples during last Ton (for per-pulse avg) |
+| 0x2C | `gap_count` | RO | Number of CH2 samples in gap_sum |
+| 0x800–0xFFC | `waveform BRAM` | RO | Captured samples (up to 512 words) |
 
-### AXI DMA — base `0x40400000`
+Software computes per-pulse gap average: `gap_avg = gap_sum / gap_count / 4096 * CH2_RANGE`
 
-S2MM (stream-to-memory) only.  Programmed by `xadc_server.py` via MMIO to capture each waveform burst into a pre-allocated DDR buffer.
+### Adaptive Feed Control
+
+The adaptive feed parameter **AF1** enables LinuxCNC to adjust feed rate based on real-time gap voltage:
+
+```
+AF1 = (Vset - Vavg) / Vavg
+```
+
+- **AF1 ≈ 0**: gap voltage matches setpoint — normal feed
+- **AF1 > 0**: gap voltage too low (short circuit risk) — slow down
+- **AF1 < 0**: gap voltage too high (open gap) — speed up
+
+AF1 is exposed as Modbus input register IR[5] (×1000, signed 16-bit) for LinuxCNC via mb2hal.
 
 ---
 
@@ -321,10 +339,11 @@ sudo XILINX_XRT=/usr /usr/local/share/pynq-venv/bin/python3 /home/xilinx/modbus_
 | 0 | `Pulse_count_lo` | Lower 16 bits of pulse count |
 | 1 | `Pulse_count_hi` | Upper 16 bits of pulse count |
 | 2 | `HV_enable` | Operator HV switch state |
-| 3 | `Gap_voltage_avg` | IIR-smoothed gap voltage (α=0.05) |
-| 4 | `Arc_ok` | 1 = gap in normal arc range |
+| 3 | `Gap_voltage_avg` | Per-pulse gap voltage average (0–4095 raw, from PL accumulator) |
+| 4 | `Arc_ok` | 1 = gap in normal arc range, 0 = short or open |
+| 5 | `AF1_x1000` | Adaptive feed parameter × 1000 (signed 16-bit): `(Vset−Vavg)/Vavg` |
 
-`Arc_ok` is intended for LinuxCNC adaptive feed control — reduce feed when `Arc_ok=0`.
+**AF1** is the primary signal for LinuxCNC adaptive feed control via `mb2hal`.  Map it to a HAL pin and connect to `adaptive-feed` for real-time feed rate adjustment based on gap conditions.
 
 ---
 
