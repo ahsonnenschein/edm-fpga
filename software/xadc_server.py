@@ -166,6 +166,15 @@ class EdmServer:
                     pc = self._edm.read(REG_PULSE_COUNT)
                     hv = self._edm.read(REG_HV_ENABLE) & 1
                     en = self._edm.read(REG_ENABLE) & 1
+                # Safety: if HV enable switch is OFF, kill PSU immediately
+                if not hv and self._psu and getattr(self, '_psu_was_on', False):
+                    try:
+                        self._psu.set_output(False)
+                        self._psu_was_on = False
+                        print("Safety: PSU OFF (Operator HV Enable switch OFF)")
+                    except: pass
+                elif hv and en:
+                    self._psu_was_on = True
                 self._psu_status_iter += 1
                 if self._psu and self._psu_status_iter >= 200:
                     self._psu_status_iter = 0
