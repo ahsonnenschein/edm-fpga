@@ -7,12 +7,25 @@ Waveform samples are in BRAM at register offsets 0x800-0xFFC.
 No AXI DMA, no PYNQ DMA driver, no tready issues.
 """
 
-import os, time, json, socket, threading, struct, sys
+import os, time, json, socket, threading, struct, sys, mmap
 
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path = [p for p in sys.path if os.path.abspath(p) != _script_dir]
 
 import numpy as np
+
+
+class DevMemMMIO:
+    """Minimal MMIO via /dev/mem — no PYNQ dependency."""
+    def __init__(self, base_addr, length):
+        self._fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+        self._mmap = mmap.mmap(self._fd, length, offset=base_addr)
+
+    def read(self, offset):
+        return struct.unpack_from("<I", self._mmap, offset)[0]
+
+    def write(self, offset, value):
+        struct.pack_into("<I", self._mmap, offset, value)
 
 PSU_BAUD    = 9600
 EDM_BASE    = 0x43C00000
@@ -109,28 +122,13 @@ class DPH8909:
 
 class EdmServer:
     def __init__(self):
-        from pynq import Overlay, MMIO
-
         self._lock    = threading.Lock()
         self._clients = []
         self._running = True
 
-        print(f"Loading overlay: {OVERLAY_BIT}")
-        Overlay(OVERLAY_BIT)
-        time.sleep(1)
-        print("Overlay loaded.")
-
-        from pynq import Clocks
-        actual = Clocks.fclk0_mhz
-        if abs(actual - 100.0) > 1.0:
-            print(f"FCLK_CLK0 was {actual:.1f} MHz — forcing to 100 MHz")
-            Clocks.fclk0_mhz = 100.0
-        else:
-            print(f"FCLK_CLK0 = {actual:.1f} MHz (OK)")
-
-        # Single MMIO mapping covers control regs AND waveform BRAM
-        self._edm = MMIO(EDM_BASE, EDM_SIZE)
-        print(f"EDM MMIO: 0x{EDM_BASE:08X}, {EDM_SIZE} bytes")
+        # Direct /dev/mem MMIO — no PYNQ dependency
+        self._edm = DevMemMMIO(EDM_BASE, EDM_SIZE)
+        print(f"EDM MMIO: 0x{EDM_BASE:08X}, {EDM_SIZE} bytes (via /dev/mem)")
 
         self._edm.write(REG_CAPTURE_LEN, 100)
         self._edm.write(REG_ENABLE, 0)     # safe default: pulses OFF at startup
@@ -166,15 +164,14 @@ class EdmServer:
                     pc = self._edm.read(REG_PULSE_COUNT)
                     hv = self._edm.read(REG_HV_ENABLE) & 1
                     en = self._edm.read(REG_ENABLE) & 1
-                # Safety: if HV enable switch is OFF, kill PSU immediately
-                if not hv and self._psu and getattr(self, '_psu_was_on', False):
+                # Safety: PSU must be ON only when BOTH hv_enable AND enable are true
+                psu_should_be_on = bool(hv and en)
+                if self._psu and psu_should_be_on != getattr(self, '_psu_is_on', False):
                     try:
-                        self._psu.set_output(False)
-                        self._psu_was_on = False
-                        print("Safety: PSU OFF (Operator HV Enable switch OFF)")
+                        self._psu.set_output(psu_should_be_on)
+                        self._psu_is_on = psu_should_be_on
+                        print(f"Safety: PSU {'ON' if psu_should_be_on else 'OFF'} (hv={hv} en={en})")
                     except: pass
-                elif hv and en:
-                    self._psu_was_on = True
                 self._psu_status_iter += 1
                 if self._psu and self._psu_status_iter >= 200:
                     self._psu_status_iter = 0
