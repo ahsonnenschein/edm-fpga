@@ -829,15 +829,21 @@ class OperatorConsole(QMainWindow):
             self._lbl_conn.setText("Connected")
             self._lbl_conn.setStyleSheet("color: #4CAF50; font-weight: bold;")
             self.statusBar().showMessage("Connected.")
+            self.setStyleSheet("")  # clear warning background
             # Push UI values to server so they're in sync from the start
             self._worker.send_cmd({'cmd': 'set_capture_len',
                                    'value': self._caplen_spin.value()})
         else:
-            self._lbl_conn.setText("Disconnected")
-            self._lbl_conn.setStyleSheet("color: gray;")
+            self._lbl_conn.setText("⚠ BOARD DISCONNECTED")
+            self._lbl_conn.setStyleSheet(
+                "color: #F44336; font-weight: bold; font-size: 14px;")
+            self.statusBar().showMessage(
+                "WARNING: Board connection lost — PSU may still be active! "
+                "Check DPH8909 front panel.")
+            self.setStyleSheet("QMainWindow { border: 3px solid red; }")
 
     def _on_error(self, msg: str):
-        self.statusBar().showMessage(f"Error: {msg}")
+        self.statusBar().showMessage(f"⚠ {msg}")
 
     # ── PSU slots ─────────────────────────────────────────────────────────────
 
