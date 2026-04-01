@@ -557,11 +557,18 @@ class OperatorConsole(QMainWindow):
         cbox = QGroupBox("Connection")
         cf   = QFormLayout(cbox)
         self._host_edit = QLineEdit(DEFAULT_HOST)
-        self._conn_btn  = QPushButton("Connect")
-        self._conn_btn.setCheckable(True)
-        self._conn_btn.clicked.connect(self._toggle_connect)
+        self._connect_btn    = QPushButton("Connect")
+        self._disconnect_btn = QPushButton("Disconnect")
+        self._connect_btn.clicked.connect(lambda: self._toggle_connect(True))
+        self._disconnect_btn.clicked.connect(lambda: self._toggle_connect(False))
+        self._lbl_conn = QLabel("Disconnected")
+        self._lbl_conn.setStyleSheet("color: gray; font-weight: bold;")
+        conn_btn_row = QHBoxLayout()
+        conn_btn_row.addWidget(self._connect_btn)
+        conn_btn_row.addWidget(self._disconnect_btn)
         cf.addRow("Board IP:", self._host_edit)
-        cf.addRow("",          self._conn_btn)
+        cf.addRow("Status:",   self._lbl_conn)
+        cf.addRow("",          conn_btn_row)
         left.addWidget(cbox)
 
         # Parameters
@@ -596,13 +603,10 @@ class OperatorConsole(QMainWindow):
         # Status
         sbox = QGroupBox("Status")
         sf   = QFormLayout(sbox)
-        self._lbl_conn    = QLabel("Disconnected")
-        self._lbl_conn.setStyleSheet("color: gray;")
         self._lbl_pulse   = QLabel("—")
         self._lbl_hven    = QLabel("—")
         self._lbl_enable  = QLabel("—")
         self._lbl_gap_avg = QLabel("—")
-        sf.addRow("Link:",        self._lbl_conn)
         sf.addRow("Pulse count:", self._lbl_pulse)
         sf.addRow("Operator HV Enable:", self._lbl_hven)
         sf.addRow("Sparks:",      self._lbl_enable)
@@ -714,18 +718,17 @@ class OperatorConsole(QMainWindow):
 
     # ── slots ─────────────────────────────────────────────────────────────────
 
-    def _toggle_connect(self, checked: bool):
-        if checked:
-            self._conn_btn.setText("Disconnect")
+    def _toggle_connect(self, connect: bool):
+        if connect:
             self._host_edit.setEnabled(False)
             self._worker.start(self._host_edit.text().strip())
         else:
-            self._conn_btn.setText("Connect")
             self._worker.stop()
             self._lbl_conn.setText("Disconnected")
-            self._lbl_conn.setStyleSheet("color: gray;")
+            self._lbl_conn.setStyleSheet("color: gray; font-weight: bold;")
             self._host_edit.setEnabled(True)
             self.statusBar().showMessage("Disconnected.")
+            self.setWindowTitle("EDM Controller – PYNQ-Z2")
 
     def _on_enable(self, on: bool):
         self._worker.send_cmd({'cmd': 'set_enable', 'value': 1 if on else 0})
