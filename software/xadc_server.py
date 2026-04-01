@@ -133,7 +133,8 @@ class EdmServer:
         print(f"EDM MMIO: 0x{EDM_BASE:08X}, {EDM_SIZE} bytes")
 
         self._edm.write(REG_CAPTURE_LEN, 100)
-        print("Capture length set to 100 samples")
+        self._edm.write(REG_ENABLE, 0)     # safe default: pulses OFF at startup
+        print("Capture length set to 100 samples, enable=0 (safe default)")
 
         # PSU
         self._psu = None; self._psu_vout = None; self._psu_iout = None
