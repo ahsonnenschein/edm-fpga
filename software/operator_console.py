@@ -600,7 +600,7 @@ class OperatorConsole(QMainWindow):
         self._lbl_gap_avg = QLabel("—")
         sf.addRow("Link:",        self._lbl_conn)
         sf.addRow("Pulse count:", self._lbl_pulse)
-        sf.addRow("HV switch:",   self._lbl_hven)
+        sf.addRow("Operator HV Enable:", self._lbl_hven)
         sf.addRow("Sparks:",      self._lbl_enable)
         sf.addRow("Gap avg:",     self._lbl_gap_avg)
 

@@ -84,10 +84,11 @@ reg [31:0] gap_sum_lat;     // latched at Ton→Toff edge
 reg [15:0] gap_count_lat;   // latched at Ton→Toff edge
 reg        pulse_out_prev;  // for edge detection
 
-// ── 2-FF synchroniser for HV enable ───────────────────
+// ── 2-FF synchroniser for Operator HV Enable ─────────
+// Switch is active-LOW: normally HIGH (enabled), pulled LOW to disable.
 reg hv_enable_r1, hv_enable_sync;
 always @(posedge S_AXI_ACLK) begin
-    hv_enable_r1   <= hv_enable;
+    hv_enable_r1   <= ~hv_enable;      // invert: LOW pin = disabled → sync=0
     hv_enable_sync <= hv_enable_r1;
 end
 assign pulse_out = pulse_internal & hv_enable_sync;
