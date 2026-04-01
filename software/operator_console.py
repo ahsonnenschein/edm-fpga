@@ -831,7 +831,7 @@ class OperatorConsole(QMainWindow):
             self._psu_vout_lbl.setText(f"{d['psu_vout']:.2f} V")
             self._psu_iout_lbl.setText(f"{d['psu_iout']:.3f} A")
             # Update output indicator from actual PSU readings
-            if d['psu_vout'] > 0.5 or d['psu_iout'] > 0.01:
+            if d['psu_vout'] > 1.0 and d['psu_iout'] > 0.05:
                 self._psu_state_lbl.setText("ON")
                 self._psu_state_lbl.setStyleSheet("color: #F44336; font-weight: bold; font-size: 13px;")
             else:
