@@ -830,6 +830,13 @@ class OperatorConsole(QMainWindow):
         if 'psu_vout' in d:
             self._psu_vout_lbl.setText(f"{d['psu_vout']:.2f} V")
             self._psu_iout_lbl.setText(f"{d['psu_iout']:.3f} A")
+            # Update output indicator from actual PSU readings
+            if d['psu_vout'] > 0.5 or d['psu_iout'] > 0.01:
+                self._psu_state_lbl.setText("ON")
+                self._psu_state_lbl.setStyleSheet("color: #F44336; font-weight: bold; font-size: 13px;")
+            else:
+                self._psu_state_lbl.setText("OFF")
+                self._psu_state_lbl.setStyleSheet("color: gray; font-weight: bold;")
 
     def _refresh_plot(self):
         self._wave_widget.refresh()
