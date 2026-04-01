@@ -589,3 +589,7 @@ The XADC VP/VN differential input measures (VP − VN).  If VN is left floating,
 When using `pair_ready` (from the XADC DRP reader) as the sample clock, each capture's first sample lands at a random phase of the XADC conversion cycle relative to the trigger.  This causes ±1 sample (~2µs) of jitter visible as misaligned traces in the persistence display.
 
 **Fix:** Replace `pair_ready`-driven BRAM writes with a fixed-rate `sample_tick` counter that resets on the trigger edge.  Every capture's samples are at identical offsets from the trigger, eliminating inter-trace jitter entirely.  The `ch1_data`/`ch2_data` values may be up to ~2µs stale (from the last `pair_ready`), but this is sub-sample and invisible.
+
+### 27. PYNQ-Z2 Arduino analog pin labels: VAUX6 is A2, not A0
+
+The PYNQ-Z2 XADC VAUX6 channel (Zynq pins K14/J14) physically connects to **Arduino analog header pin A2**, not A0 as some documentation suggests.  The Arduino J1 header pin numbering is A5 (pin 1) through A0 (pin 6), but the VAUX channel-to-pin mapping does not follow sequential order.  Verify analog connections empirically — plug in a known signal and check which pin produces a reading.
