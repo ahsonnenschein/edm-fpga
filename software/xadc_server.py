@@ -311,7 +311,12 @@ class EdmServer:
         c = cmd.get('cmd',''); v = cmd.get('value',0)
         if c == 'set_ton': self._write_edm(REG_TON, max(1,int(v))*100)
         elif c == 'set_toff': self._write_edm(REG_TOFF, max(1,int(v))*100)
-        elif c == 'set_enable': self._write_edm(REG_ENABLE, 1 if v else 0)
+        elif c == 'set_enable':
+            self._write_edm(REG_ENABLE, 1 if v else 0)
+            # Safety interlock: disable PSU output when sparks disabled
+            if not v and self._psu:
+                self._psu.set_output(False)
+                print("Safety: PSU output disabled (enable=0)")
         elif c == 'set_capture_len': self._write_edm(REG_CAPTURE_LEN, max(1,min(int(v),MAX_CAPTURE)))
         elif c == 'get_params':
             with self._lock:
