@@ -575,18 +575,22 @@ class OperatorConsole(QMainWindow):
         self._toff_spin.setRange(1, 100000)
         self._toff_spin.setValue(90)
         self._toff_spin.setSuffix(" µs")
-        self._enable_btn = QPushButton("Enable Pulses")
-        self._enable_btn.setCheckable(True)
-        self._enable_btn.setStyleSheet(
-            "QPushButton:checked { background-color: #c62828; color: white; font-weight: bold; }"
-        )
-        self._enable_btn.clicked.connect(self._on_enable)
+        self._spark_on_btn  = QPushButton("Start Sparks")
+        self._spark_off_btn = QPushButton("Stop Sparks")
+        self._spark_on_btn.clicked.connect(lambda: self._on_enable(True))
+        self._spark_off_btn.clicked.connect(lambda: self._on_enable(False))
+        self._spark_state_lbl = QLabel("OFF")
+        self._spark_state_lbl.setStyleSheet("color: gray; font-weight: bold;")
+        spark_btn_row = QHBoxLayout()
+        spark_btn_row.addWidget(self._spark_on_btn)
+        spark_btn_row.addWidget(self._spark_off_btn)
         apply_btn = QPushButton("Apply")
         apply_btn.clicked.connect(self._apply_params)
         pf.addRow("Ton:",  self._ton_spin)
         pf.addRow("Toff:", self._toff_spin)
         pf.addRow("",      apply_btn)
-        pf.addRow("",      self._enable_btn)
+        pf.addRow("Sparks:",  self._spark_state_lbl)
+        pf.addRow("",        spark_btn_row)
         left.addWidget(pbox)
 
         # Status
@@ -633,22 +637,26 @@ class OperatorConsole(QMainWindow):
         self._psu_i_spin.setSuffix(" A")
         psu_set_btn = QPushButton("Set V / I")
         psu_set_btn.clicked.connect(self._psu_set)
-        self._psu_out_btn = QPushButton("Output ON")
-        self._psu_out_btn.setCheckable(True)
-        self._psu_out_btn.setStyleSheet(
-            "QPushButton:checked { background-color: #c62828; color: white; font-weight: bold; }"
-        )
-        self._psu_out_btn.clicked.connect(self._psu_output)
-        self._psu_link_lbl   = QLabel("—")   # connected / not available
+        self._psu_on_btn  = QPushButton("Turn ON")
+        self._psu_off_btn = QPushButton("Turn OFF")
+        self._psu_on_btn.clicked.connect(lambda: self._psu_output(True))
+        self._psu_off_btn.clicked.connect(lambda: self._psu_output(False))
+        self._psu_state_lbl = QLabel("OFF")
+        self._psu_state_lbl.setStyleSheet("color: gray; font-weight: bold;")
+        psu_btn_row = QHBoxLayout()
+        psu_btn_row.addWidget(self._psu_on_btn)
+        psu_btn_row.addWidget(self._psu_off_btn)
+        self._psu_link_lbl   = QLabel("—")
         self._psu_vout_lbl   = QLabel("—")
         self._psu_iout_lbl   = QLabel("—")
-        psf.addRow("Voltage:",  self._psu_v_spin)
-        psf.addRow("I limit:",  self._psu_i_spin)
-        psf.addRow("",          psu_set_btn)
-        psf.addRow("",          self._psu_out_btn)
-        psf.addRow("PSU link:", self._psu_link_lbl)
-        psf.addRow("V out:",    self._psu_vout_lbl)
-        psf.addRow("I out:",    self._psu_iout_lbl)
+        psf.addRow("Voltage:",    self._psu_v_spin)
+        psf.addRow("I limit:",    self._psu_i_spin)
+        psf.addRow("",            psu_set_btn)
+        psf.addRow("Output:",     self._psu_state_lbl)
+        psf.addRow("",            psu_btn_row)
+        psf.addRow("PSU link:",   self._psu_link_lbl)
+        psf.addRow("V out:",      self._psu_vout_lbl)
+        psf.addRow("I out:",      self._psu_iout_lbl)
         left.addWidget(psbox)
 
         left.addStretch()
@@ -719,9 +727,14 @@ class OperatorConsole(QMainWindow):
             self._host_edit.setEnabled(True)
             self.statusBar().showMessage("Disconnected.")
 
-    def _on_enable(self, checked: bool):
-        self._enable_btn.setText("Disable Pulses" if checked else "Enable Pulses")
-        self._worker.send_cmd({'cmd': 'set_enable', 'value': 1 if checked else 0})
+    def _on_enable(self, on: bool):
+        self._worker.send_cmd({'cmd': 'set_enable', 'value': 1 if on else 0})
+        if on:
+            self._spark_state_lbl.setText("ON")
+            self._spark_state_lbl.setStyleSheet("color: #F44336; font-weight: bold; font-size: 13px;")
+        else:
+            self._spark_state_lbl.setText("OFF")
+            self._spark_state_lbl.setStyleSheet("color: gray; font-weight: bold;")
 
     def _apply_params(self):
         ton  = self._ton_spin.value()
@@ -829,7 +842,8 @@ class OperatorConsole(QMainWindow):
             self._lbl_conn.setText("Connected")
             self._lbl_conn.setStyleSheet("color: #4CAF50; font-weight: bold;")
             self.statusBar().showMessage("Connected.")
-            self.setStyleSheet("")  # clear warning background
+            self.setStyleSheet("")
+            self.setWindowTitle("EDM Controller – PYNQ-Z2")
             # Push UI values to server so they're in sync from the start
             self._worker.send_cmd({'cmd': 'set_capture_len',
                                    'value': self._caplen_spin.value()})
@@ -841,6 +855,7 @@ class OperatorConsole(QMainWindow):
                 "WARNING: Board connection lost — PSU may still be active! "
                 "Check DPH8909 front panel.")
             self.setStyleSheet("QMainWindow { border: 3px solid red; }")
+            self.setWindowTitle("⚠ EDM Controller — BOARD DISCONNECTED — CHECK PSU ⚠")
 
     def _on_error(self, msg: str):
         self.statusBar().showMessage(f"⚠ {msg}")
@@ -853,9 +868,14 @@ class OperatorConsole(QMainWindow):
         self._worker.send_cmd({'cmd': 'set_psu_vi', 'voltage': v, 'current': i})
         self.statusBar().showMessage(f"PSU set: {v:.1f} V  {i:.2f} A")
 
-    def _psu_output(self, checked: bool):
-        self._worker.send_cmd({'cmd': 'set_psu_output', 'value': 1 if checked else 0})
-        self._psu_out_btn.setText("Output OFF" if checked else "Output ON")
+    def _psu_output(self, on: bool):
+        self._worker.send_cmd({'cmd': 'set_psu_output', 'value': 1 if on else 0})
+        if on:
+            self._psu_state_lbl.setText("ON")
+            self._psu_state_lbl.setStyleSheet("color: #F44336; font-weight: bold; font-size: 13px;")
+        else:
+            self._psu_state_lbl.setText("OFF")
+            self._psu_state_lbl.setStyleSheet("color: gray; font-weight: bold;")
 
     def closeEvent(self, event):
         self._worker.stop()

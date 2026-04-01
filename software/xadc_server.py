@@ -95,7 +95,7 @@ class DPH8909:
         frame=f":{self._addr:02d}r{c:02d}=0,\r\n".encode()
         with self._lock: self._flush(); self._wb(frame); resp=self._rl()
         if not resp: raise IOError("No response")
-        sep=max(resp.rfind('='),resp.rfind(':')); return int(resp[sep+1:].rstrip(','))
+        sep=max(resp.rfind('='),resp.rfind(':')); return int(resp[sep+1:].rstrip(',.').strip())
     def set_voltage(self,v): self._send('w',10,round(v*100))
     def set_current(self,a): self._send('w',11,round(a*1000))
     def set_voltage_current(self,v,a):
@@ -168,8 +168,10 @@ class EdmServer:
                 self._psu_status_iter += 1
                 if self._psu and self._psu_status_iter >= 200:
                     self._psu_status_iter = 0
-                    try: self._psu_vout, self._psu_iout = self._psu.read_output()
-                    except: pass
+                    try:
+                        self._psu_vout, self._psu_iout = self._psu.read_output()
+                    except Exception as e:
+                        print(f"PSU readback failed: {e}")
                 # Per-pulse gap voltage average (computed in PL)
                 gap_sum = self._edm.read(REG_GAP_SUM)
                 gap_count = self._edm.read(REG_GAP_COUNT) & 0xFFFF
