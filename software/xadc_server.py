@@ -314,9 +314,14 @@ class EdmServer:
         elif c == 'set_enable':
             self._write_edm(REG_ENABLE, 1 if v else 0)
             # Safety interlock: PSU output follows enable state
+            # Delay to avoid serial collision with any pending PSU command
             if self._psu:
-                self._psu.set_output(bool(v))
-                print(f"Safety: PSU output {'ON' if v else 'OFF'} (enable={'1' if v else '0'})")
+                time.sleep(0.1)
+                try:
+                    self._psu.set_output(bool(v))
+                    print(f"Safety: PSU output {'ON' if v else 'OFF'}")
+                except Exception as e:
+                    print(f"Safety: PSU command failed: {e}")
         elif c == 'set_capture_len': self._write_edm(REG_CAPTURE_LEN, max(1,min(int(v),MAX_CAPTURE)))
         elif c == 'get_params':
             with self._lock:
