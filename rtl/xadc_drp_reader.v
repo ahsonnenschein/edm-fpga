@@ -49,7 +49,7 @@ assign dwe_in = 1'b0;
 assign di_in  = 16'h0;
 
 localparam ADDR_CH1  = 7'h03;   // VP/VN result register
-localparam ADDR_CH2  = 7'h16;   // VAUX6 result register (J1 A0)
+localparam ADDR_CH2  = 7'h16;   // VAUX6 result register (J1 A2)
 localparam CH_VP_VN  = 5'h03;   // channel_out code for VP/VN conversion done
 localparam CH_VAUX6  = 5'h16;   // channel_out code for VAUX6 conversion done
 

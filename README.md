@@ -24,7 +24,7 @@ FPGA-based EDM (Electrical Discharge Machining) pulse controller running on the 
 | PL clock | 100 MHz (FCLK0 from PS) |
 | ADC | On-chip XADC, simultaneous sampling, 480 kSPS per channel, 12-bit |
 | CH1 | Arc current — VP/VN differential input (opto-isolated shunt sense) |
-| CH2 | Gap voltage — VAUXP6/VAUXN6 (A0/A1) via on-board ÷5 divider |
+| CH2 | Gap voltage — VAUXP6/VAUXN6 (A2) via on-board ÷5 divider |
 | Pulse output | Arduino AR0 (T14) → GEDM pulse board |
 | HV enable input | Arduino AR1 (U12) ← operator toggle switch |
 | Green lamp | Arduino AR2 (U13) — HV off |
@@ -52,7 +52,7 @@ CH1 scaling: `CH1_DIVIDER = 3.0` in `xadc_server.py` — adjust to match your re
 
 | Board label | Signal | Connect to |
 |-------------|--------|------------|
-| A0 | VAUX6+ | Gap voltage probe + (Hantek HT8050 output) |
+| A2 | VAUX6+ | Gap voltage probe + (Hantek HT8050 output) |
 | A1 | VAUX6− | Gap voltage probe − / GND |
 
 ### Digital — Arduino header J4, pins AR0–AR7 (3.3 V LVCMOS)
@@ -406,7 +406,7 @@ if abs(Clocks.fclk0_mhz - 100.0) > 1.0:
 
 ### 2. XADC channel naming: VAUX1 vs VAUX6
 
-The PYNQ-Z2 Arduino analog header **A0/A1** maps to **VAUX6** (pins K14/J14), not VAUX1.  The Vivado XADC Wizard property is `CHANNEL_ENABLE_VAUXP6_VAUXN6`.  Using the wrong channel silently produces zero readings with no synthesis or implementation errors — the XADC simply samples an unconnected channel.
+The PYNQ-Z2 Arduino analog header **A2 maps to VAUX6** (pins K14/J14), not VAUX1.  The Vivado XADC Wizard property is `CHANNEL_ENABLE_VAUXP6_VAUXN6`.  Using the wrong channel silently produces zero readings with no synthesis or implementation errors — the XADC simply samples an unconnected channel.
 
 ### 3. XADC clears result registers at the START of conversion, not the end
 
@@ -440,7 +440,7 @@ The dedicated VP/VN differential input on the PYNQ-Z2 has a 140 Ohm series resis
 
 The Arduino analog inputs A0–A5 (VAUX channels) do **not** have this RC filter — they have only a series resistor with no capacitor, giving much faster response.
 
-**Implication:** Route the fast-changing signal (gap voltage via differential probe) to A0/VAUX6, and the slower signal (current sense) to VP/VN.
+**Implication:** Route the fast-changing signal (gap voltage via differential probe) to A2/VAUX6, and the slower signal (current sense) to VP/VN.
 
 ### 8. PYNQ overlay load crashes the SSH session
 
