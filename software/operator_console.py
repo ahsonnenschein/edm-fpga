@@ -645,8 +645,8 @@ class OperatorConsole(QMainWindow):
         self._psu_off_btn = QPushButton("Turn OFF")
         self._psu_on_btn.clicked.connect(lambda: self._psu_output(True))
         self._psu_off_btn.clicked.connect(lambda: self._psu_output(False))
-        self._psu_state_lbl = QLabel("OFF")
-        self._psu_state_lbl.setStyleSheet("color: gray; font-weight: bold;")
+        self._psu_state_lbl = QLabel("UNKNOWN")
+        self._psu_state_lbl.setStyleSheet("color: #FF9800; font-weight: bold;")
         psu_btn_row = QHBoxLayout()
         psu_btn_row.addWidget(self._psu_on_btn)
         psu_btn_row.addWidget(self._psu_off_btn)
@@ -830,7 +830,15 @@ class OperatorConsole(QMainWindow):
                 self._psu_link_lbl.setText("Not available")
                 self._psu_link_lbl.setStyleSheet("color: gray;")
 
-        if 'psu_vout' in d:
+        psu_comms = d.get('psu_comms_ok')
+        if psu_comms is False:
+            # Serial comms to PSU not confirmed — state is unknown
+            self._psu_vout_lbl.setText("COMMS FAIL")
+            self._psu_iout_lbl.setText("COMMS FAIL")
+            self._psu_state_lbl.setText("⚠ UNKNOWN")
+            self._psu_state_lbl.setStyleSheet(
+                "color: #FF9800; font-weight: bold; font-size: 13px;")
+        elif 'psu_vout' in d:
             self._psu_vout_lbl.setText(f"{d['psu_vout']:.2f} V")
             self._psu_iout_lbl.setText(f"{d['psu_iout']:.3f} A")
             # Update output indicator from actual PSU readings

@@ -69,9 +69,9 @@ class DPH8909:
         def sw(m,o,v): m.seek(o); m.write(struct.pack("<I",v&0xFFFFFFFF))
         def sr(m,o): m.seek(o); return struct.unpack("<I",m.read(4))[0]
         sw(slcr,0x008,0xDF0D)
-        sw(slcr,0x154,sr(slcr,0x154)|0x02)
-        sw(slcr,0x12C,sr(slcr,0x12C)|(1<<21))
-        sw(slcr,0x228,sr(slcr,0x228)&~0x0C)
+        sw(slcr,0x154,sr(slcr,0x154)|0x02)    # UART1 ref clock enable
+        sw(slcr,0x12C,sr(slcr,0x12C)|(1<<21)) # UART1 AMBA clock enable
+        sw(slcr,0x228,sr(slcr,0x228)&~0x0C)   # Clear UART1 reset bits
         sw(slcr,0x004,0x767B)
         slcr.close(); fd.close()
         time.sleep(0.01)
@@ -88,7 +88,7 @@ class DPH8909:
     def close(self): pass
     def _flush(self):
         for _ in range(64):
-            if self._ur(0x2C)&0x02: break
+            if self._ur(0x2C)&0x02: break  # REMPTY (bit 1): RX FIFO empty
             self._ur(0x30)
     def _wb(self,data):
         for b in data:
@@ -97,7 +97,7 @@ class DPH8909:
     def _rl(self,timeout=0.5):
         buf=bytearray(); t0=time.time()
         while time.time()-t0<timeout:
-            if self._ur(0x2C)&0x02: time.sleep(0.001); continue
+            if self._ur(0x2C)&0x02: time.sleep(0.001); continue  # REMPTY (bit 1): RX FIFO empty
             ch=self._ur(0x30)&0xFF; buf.append(ch)
             if ch==0x0A: break
         return buf.decode(errors='replace').strip()
@@ -137,9 +137,21 @@ class EdmServer:
         # PSU
         self._psu = None; self._psu_vout = None; self._psu_iout = None
         self._psu_status_iter = 0
+        self._psu_comms_ok = False
+        self._psu_comms_fail = 0
         try:
             self._psu = DPH8909(baudrate=PSU_BAUD)
             print(f"PSU connected via MMIO UART1 @ {PSU_BAUD} baud")
+            # Quick loopback check: put UART1 in local loopback, send 0xA5, expect echo
+            self._psu._uw(0x04, 0x0200 | 0x20)  # MR: loopback mode (bits [9:8]=10) + 8N1
+            self._psu._uw(0x30, 0xA5)
+            time.sleep(0.01)
+            echo = self._psu._ur(0x30) & 0xFF
+            self._psu._uw(0x04, 0x20)  # restore normal mode
+            if echo == 0xA5:
+                print("UART1 loopback OK — TX→RX path functional")
+            else:
+                print(f"UART1 loopback FAIL (got 0x{echo:02X}, expected 0xA5) — TX may not reach DPH")
         except Exception as e:
             print(f"PSU not available: {e}")
 
@@ -177,8 +189,13 @@ class EdmServer:
                     self._psu_status_iter = 0
                     try:
                         self._psu_vout, self._psu_iout = self._psu.read_output()
+                        self._psu_comms_ok = True
+                        self._psu_comms_fail = 0
                     except Exception as e:
-                        print(f"PSU readback failed: {e}")
+                        self._psu_comms_fail += 1
+                        self._psu_comms_ok = False
+                        if self._psu_comms_fail <= 3 or self._psu_comms_fail % 20 == 0:
+                            print(f"PSU readback failed (#{self._psu_comms_fail}): {e}")
                 # Per-pulse gap voltage average (computed in PL)
                 gap_sum = self._edm.read(REG_GAP_SUM)
                 gap_count = self._edm.read(REG_GAP_COUNT) & 0xFFFF
@@ -187,6 +204,7 @@ class EdmServer:
                 d = {'type':'status','ts':round(t0,4),'ch1':round(ch1,4),
                      'ch2':round(ch2,4),'temp':round(temp,1),'pulse_count':pc,
                      'hv_enable':hv,'enable':en,'psu_ok':self._psu is not None,
+                     'psu_comms_ok':self._psu_comms_ok,
                      'gap_avg':round(gap_avg_v, 2)}
                 if self._psu_vout is not None:
                     d['psu_vout']=round(self._psu_vout,2)
