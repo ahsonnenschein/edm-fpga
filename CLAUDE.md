@@ -116,6 +116,22 @@ The operator switch pulls to ground when disabled. The RTL inverts this: `hv_ena
 | Vaux6_n | J1 A2 | J14 | Gap voltage analog − |
 | VP/VN | XADC header | M9/M10 | Arc current (dedicated, no XDC needed) |
 
+## DPH8909 PSU Connection (Pmod B)
+
+The DPH8909 bench power supply is controlled via PS UART1 routed through EMIO to Pmod B. Direct 3.3V TTL connection — no level shifter needed.
+
+| Pmod B Pin | Signal | Connect to |
+|------------|--------|------------|
+| Pin 1 (W14) | UART1 TX (PS→DPH) | DPH8909 RX |
+| Pin 2 (Y14) | UART1 RX (DPH→PS) | DPH8909 TX |
+| Pin 5 or 11 | GND | DPH8909 GND |
+
+- Baud rate: 9600, 8N1
+- Protocol: SCPI-like text commands (e.g., `w20 0800,0100` sets 8.00V, 1.00A)
+- The UART is driven via MMIO writes to PS UART1 registers at 0xE000_1000 (not /dev/ttyPS1) because the device tree overlay for ttyPS1 fails when started via SSH
+- SLCR clock gate at 0xF800_0154 must be enabled for UART1 to function
+- Response parsing: strip trailing `.` and `,` characters (DPH8909 quirk)
+
 ## Software Components
 
 ### xadc_server.py (runs on the board)
