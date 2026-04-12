@@ -1,0 +1,15 @@
+[Unit]
+Description=EDM FPGA Controller Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 45
+ExecStartPre=/usr/bin/python3 -c "from pynq import Overlay; Overlay('/home/xilinx/edm_pynq.bit')"
+ExecStart=/usr/bin/python3 -u /home/xilinx/xadc_server.py
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/home/xilinx
+
+[Install]
+WantedBy=multi-user.target
