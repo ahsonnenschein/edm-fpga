@@ -1,6 +1,6 @@
 #!/usr/local/share/pynq-venv/bin/python3
 """
-xadc_server.py  —  Board-side data server for EDM PYNQ-Z2 controller
+xadc_server.py - Board-side data server for EDM PYNQ-Z2 controller
 
 Rev 11: Reads waveform data via AXI-Lite MMIO (no DMA).
 Waveform samples are in BRAM at register offsets 0x800-0xFFC.
@@ -16,7 +16,7 @@ import numpy as np
 
 
 class DevMemMMIO:
-    """Minimal MMIO via /dev/mem — no PYNQ dependency."""
+    """Minimal MMIO via /dev/mem - no PYNQ dependency."""
     def __init__(self, base_addr, length):
         self._fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
         self._mmap = mmap.mmap(self._fd, length, offset=base_addr)
@@ -29,7 +29,7 @@ class DevMemMMIO:
 
 PSU_BAUD    = 9600
 EDM_BASE    = 0x43C00000
-EDM_SIZE    = 0x1000        # 4KB — control regs + waveform BRAM
+EDM_SIZE    = 0x1000        # 4KB - control regs + waveform BRAM
 SAMPLE_HZ   = 200
 TCP_PORT    = 5006
 OVERLAY_BIT = '/home/xilinx/edm_pynq.bit'
@@ -126,7 +126,7 @@ class EdmServer:
         self._clients = []
         self._running = True
 
-        # Direct /dev/mem MMIO — no PYNQ dependency
+        # Direct /dev/mem MMIO - no PYNQ dependency
         self._edm = DevMemMMIO(EDM_BASE, EDM_SIZE)
         print(f"EDM MMIO: 0x{EDM_BASE:08X}, {EDM_SIZE} bytes (via /dev/mem)")
 
@@ -149,9 +149,9 @@ class EdmServer:
             echo = self._psu._ur(0x30) & 0xFF
             self._psu._uw(0x04, 0x20)  # restore normal mode
             if echo == 0xA5:
-                print("UART1 loopback OK — TX→RX path functional")
+                print("UART1 loopback OK - TX->RX path functional")
             else:
-                print(f"UART1 loopback FAIL (got 0x{echo:02X}, expected 0xA5) — TX may not reach DPH")
+                print(f"UART1 loopback FAIL (got 0x{echo:02X}, expected 0xA5) - TX may not reach DPH")
         except Exception as e:
             print(f"PSU not available: {e}")
 
