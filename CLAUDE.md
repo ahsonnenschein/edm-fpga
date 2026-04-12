@@ -194,9 +194,15 @@ Vivado project directory: `/home/sonnensn/edm_vivado/edm_pynq.xpr`
 
 Board IP: 192.168.2.99, user: xilinx, password: xilinx
 
+The board runs from USB 5V power (JP5 set to USB). The 12V external supply was only used during debugging — crashes were software, not power-related.
+
 ```bash
 # Copy files
 sshpass -p 'xilinx' scp edm_pynq.bit edm_pynq.hwh xadc_server.py xilinx@192.168.2.99:/home/xilinx/
+
+# Deploy systemd service (must be done once; persists through clean shutdowns)
+sshpass -p 'xilinx' scp deploy/edm.service xilinx@192.168.2.99:/tmp/edm.service
+sshpass -p 'xilinx' ssh -o StrictHostKeyChecking=no xilinx@192.168.2.99 'echo xilinx | sudo -S cp /tmp/edm.service /etc/systemd/system/edm.service && sudo systemctl daemon-reload && sudo systemctl enable edm.service && sudo sync'
 
 # Kill and restart server
 sshpass -p 'xilinx' ssh -o StrictHostKeyChecking=no xilinx@192.168.2.99 'echo xilinx | sudo -S killall -9 python3 2>/dev/null'
@@ -216,8 +222,8 @@ timeout 3 bash -c 'echo "" | nc 192.168.2.99 5006' | head -1
 
 ## Known Issues / Current State
 
-- **PYNQ-Z2 board is dead** (20V applied to USB power input, 2026-04-01). Replacement ordered.
-- **PYNQ boot can be fragile** — consider loading bitstream via U-Boot instead of Python Overlay class
+- **PYNQ boot timing — edm.service must start AFTER base.bin loads** — The Jupyter/pl_server loads the default `base.bin` overlay ~40s into boot, overwriting any bitstream loaded earlier. If edm.service starts before this, xadc_server.py gets an AXI bus error when it touches 0x43C00000 (slave no longer present) → kernel panic. **Fix: `ExecStartPre=/bin/sleep 45` in edm.service** delays FPGA programming until after base.bin has loaded. Confirmed stable on cold boot: base.bin at ~40s, edm_pynq.bit at ~67s. See `deploy/edm.service`.
+- **Kernel panics leave filesystem dirty** — ext4 is never cleanly unmounted after a crash, so `systemctl disable` and similar changes don't persist across power cycles. The journal shows "corrupted or uncleanly shut down" every boot. To apply filesystem changes after a crash, use the serial console (/dev/ttyUSB1 at 115200) — login appears at ~29s, before the crash window. See `/home/sonnensn/serial_fix.py` for an example.
 - **Temperature reading is wrong** (-272°C) — XADC calibration artifact, not critical
 - **GEDM pulseboard has ~500Ω off-resistance** — PSU voltage can leak through even with pulses off. Hardware interlock (DPDT switch or relay) needed to physically cut PSU power when HV enable is off.
 - **Software PSU safety interlock works** but depends on xadc_server running
