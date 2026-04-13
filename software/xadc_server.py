@@ -56,6 +56,11 @@ CH1_PROBE   = 3.333    # calibrated: 2A reads as 2.0 (was 50.0 for voltage probe
 CH2_RANGE   = 198.0   # calibrated: 20V gap reads as 20.0 (÷5 on-board + XADC scaling)
 MAX_CAPTURE = 512
 
+# PL fabric clock frequency. PYNQ Overlay() sets FCLK0 to 62.5 MHz (IO PLL 1000 MHz / 4 / 4)
+# regardless of the 100 MHz target in the bitstream/HWH. Verified via SLCR FPGA0_CLK_CTRL.
+PL_CLK_MHZ  = 62.5
+CYCLES_PER_US = PL_CLK_MHZ  # 1 us * 62.5 MHz = 62.5 cycles -> use int(us * CYCLES_PER_US)
+
 
 # ── DPH8909 PSU driver (MMIO UART1) ─────────────────────────────────────────
 
@@ -336,8 +341,8 @@ class EdmServer:
 
     def _handle_cmd(self, cmd):
         c = cmd.get('cmd',''); v = cmd.get('value',0)
-        if c == 'set_ton': self._write_edm(REG_TON, max(1,int(v))*100)
-        elif c == 'set_toff': self._write_edm(REG_TOFF, max(1,int(v))*100)
+        if c == 'set_ton': self._write_edm(REG_TON, max(1, round(v * CYCLES_PER_US)))
+        elif c == 'set_toff': self._write_edm(REG_TOFF, max(1, round(v * CYCLES_PER_US)))
         elif c == 'set_enable':
             self._write_edm(REG_ENABLE, 1 if v else 0)
             # Safety interlock: PSU output follows enable state
@@ -352,8 +357,8 @@ class EdmServer:
         elif c == 'set_capture_len': self._write_edm(REG_CAPTURE_LEN, max(1,min(int(v),MAX_CAPTURE)))
         elif c == 'get_params':
             with self._lock:
-                return {'ton_us':self._edm.read(REG_TON)//100,
-                        'toff_us':self._edm.read(REG_TOFF)//100,
+                return {'ton_us':round(self._edm.read(REG_TON) / CYCLES_PER_US),
+                        'toff_us':round(self._edm.read(REG_TOFF) / CYCLES_PER_US),
                         'enable':self._edm.read(REG_ENABLE)&1,
                         'capture_len':self._edm.read(REG_CAPTURE_LEN)&0xFFFF}
         elif c == 'set_psu_voltage':
