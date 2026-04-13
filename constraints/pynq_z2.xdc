@@ -24,8 +24,11 @@ set_property -dict {PACKAGE_PIN J14 IOSTANDARD LVCMOS33} [get_ports Vaux6_0_v_n]
 # AR0: Pulse output → GEDM pulseboard
 set_property -dict {PACKAGE_PIN T14 IOSTANDARD LVCMOS33} [get_ports pulse_out_0]
 
-# AR1: Operator HV enable switch input (active high)
-set_property -dict {PACKAGE_PIN U12 IOSTANDARD LVCMOS33} [get_ports hv_enable_0]
+# AR1: Operator HV enable switch input (active-LOW to disable, float=enabled)
+# PULLUP ensures a defined HIGH when switch is open (enabled position).
+# Without it, a floating input picks up FPGA switching noise (~3us after trigger)
+# which glitches hv_enable_sync and causes brief dips on pulse_out.
+set_property -dict {PACKAGE_PIN U12 IOSTANDARD LVCMOS33 PULLUP true} [get_ports hv_enable_0]
 
 # AR2: Green lamp (HV off) → HFET module
 set_property -dict {PACKAGE_PIN U13 IOSTANDARD LVCMOS33} [get_ports lamp_green_0]

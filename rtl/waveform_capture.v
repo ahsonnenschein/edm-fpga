@@ -44,10 +44,6 @@ module waveform_capture (
     output reg  [31:0] waveform_count
 );
 
-// ── Sample rate ──────────────────────────────────────
-// 100 MHz / 208 = 480.769 kSPS — matches the XADC pair_ready rate
-localparam SAMPLE_PERIOD = 208;
-
 // ── Local BRAM buffer (512 × 25 bits) ────────────────
 localparam MAX_DEPTH = 512;
 localparam ADDR_W    = 9;
@@ -68,27 +64,6 @@ assign bram_rd_data = {rd_raw[24:13], 4'b0000,
 assign m_axis_tdata  = 32'd0;
 assign m_axis_tvalid = 1'b0;
 assign m_axis_tlast  = 1'b0;
-
-// ── Fixed-rate sample tick ───────────────────────────
-reg [15:0] tick_counter;
-reg        sample_tick;
-
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        tick_counter <= 16'd0;
-        sample_tick  <= 1'b0;
-    end else begin
-        sample_tick <= 1'b0;
-        if (!capturing) begin
-            tick_counter <= 16'd0;
-        end else if (tick_counter >= SAMPLE_PERIOD - 1) begin
-            tick_counter <= 16'd0;
-            sample_tick  <= 1'b1;
-        end else begin
-            tick_counter <= tick_counter + 16'd1;
-        end
-    end
-end
 
 // ── FSM ──────────────────────────────────────────────
 localparam S_IDLE    = 1'd0;
