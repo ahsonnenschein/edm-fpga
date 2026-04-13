@@ -74,6 +74,15 @@ Setting `ADC_OFFSET_AND_GAIN_CALIBRATION=false` or similar params silently corru
 ### HV enable switch is active-LOW
 The operator switch pulls to ground when disabled. The RTL inverts this: `hv_enable_r1 <= ~hv_enable`. Don't "fix" this — it's correct.
 
+### hv_enable pin (AR1) MUST have a pull-up
+Without a pull-up, the hv_enable input floats when the switch is in the enabled (open) position. FPGA fabric switching (~3µs after each pulse trigger, from the gap accumulator pair_ready update) couples into the floating pin, glitching `hv_enable_sync` and causing brief dips on `pulse_out` — visible as "digital noise bursts ~4µs after trigger" on the scope. Fix: `PULLUP true` in XDC, or a 10kΩ resistor from AR1 to 3.3V. **Requires bitstream rebuild.**
+
+### PL clock is 62.5 MHz, not 100 MHz
+PYNQ's `Overlay()` sets FCLK0 to 62.5 MHz (IO PLL 1000 MHz ÷ 4 ÷ 4) via SLCR, overriding the 100 MHz target. All cycle↔µs conversions in software must use `CYCLES_PER_US = 62.5`. Attempting to fix this by calling `Clocks.fclk0_mhz = 100` after Overlay() locks up the board (system hang, no kernel panic). Do not do this.
+
+### PSU output indicator uses voltage only
+The DPH8909 ammeter reads low average current at EDM duty cycles (e.g., 36mA average even at 4A peak with 6% duty). The "Output: ON" indicator must check only `psu_vout > 1.0V` — the current threshold causes false "OFF" readings during pulsed operation.
+
 ## AXI Register Map (base: 0x43C0_0000)
 
 | Offset | Name | R/W | Description |
