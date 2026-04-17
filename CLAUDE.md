@@ -231,16 +231,113 @@ timeout 3 bash -c 'echo "" | nc 192.168.2.99 5006' | head -1
 
 ## Known Issues / Current State
 
-- **PYNQ boot timing — edm.service must start AFTER base.bin loads** — The Jupyter/pl_server loads the default `base.bin` overlay ~40s into boot, overwriting any bitstream loaded earlier. If edm.service starts before this, xadc_server.py gets an AXI bus error when it touches 0x43C00000 (slave no longer present) → kernel panic. **Fix: `ExecStartPre=/bin/sleep 45` in edm.service** delays FPGA programming until after base.bin has loaded. Confirmed stable on cold boot: base.bin at ~40s, edm_pynq.bit at ~67s. See `deploy/edm.service`.
-- **Kernel panics leave filesystem dirty** — ext4 is never cleanly unmounted after a crash, so `systemctl disable` and similar changes don't persist across power cycles. The journal shows "corrupted or uncleanly shut down" every boot. To apply filesystem changes after a crash, use the serial console (/dev/ttyUSB1 at 115200) — login appears at ~29s, before the crash window. See `/home/sonnensn/serial_fix.py` for an example.
+- **PYNQ-Z2 replacement deployed** (2026-04-09) — PYNQ 2.5, auto-starts via systemd service `edm.service`
+- **PYNQ boot timing — edm.service must start AFTER base.bin loads** — The Jupyter/pl_server loads the default `base.bin` overlay ~40s into boot, overwriting any bitstream loaded earlier. **Fix: `ExecStartPre=/bin/sleep 45` in edm.service**. See `deploy/edm.service`.
+- **Kernel panics leave filesystem dirty** — ext4 is never cleanly unmounted after a crash. Use serial console (/dev/ttyUSB1 at 115200) to apply filesystem changes.
 - **Temperature reading is wrong** (-272°C) — XADC calibration artifact, not critical
 - **GEDM pulseboard has ~500Ω off-resistance** — PSU voltage can leak through even with pulses off. Hardware interlock (DPDT switch or relay) needed to physically cut PSU power when HV enable is off.
 - **Software PSU safety interlock works** but depends on xadc_server running
 
+## QMTech Zynq-7010 Board (AD9226 upgrade platform)
+
+A $45 QMTech ZYJZGW Zynq-7010 Starter Kit is being brought up as the next-gen EDM controller with an AD9226 dual-channel 65 MSPS ADC.
+
+### Board specs
+- XC7Z010-1CLG400C, 512MB DDR3, micro SD boot
+- MII Ethernet via PS GEM0 EMIO (IP101GA PHY) — native Linux driver, no PL Ethernet MAC needed
+- UART0 on MIO 14-15 (CH340 USB serial), USB host on MIO 28-39
+- JP2 header: 50-pin BANK34 PL I/O (for AD9226 ADC)
+- JP5 header: 50-pin BANK35 PL I/O + PS MIO (for EDM digital I/O)
+- PL clock: 50 MHz external crystal
+- Vendor reference: `/home/sonnensn/qmtech_ref/` (cloned from GitHub ChinaQMTECH/ZYJZGW_ZYNQ_STARTER_KIT_V2)
+
+### Ethernet PHY pin assignments (MII, BANK35)
+| Signal | Pin |  Signal | Pin |
+|--------|-----|---------|-----|
+| TXEN | D20 | RXDV | M18 |
+| TXD0 | G20 | RXD0 | L20 |
+| TXD1 | G19 | RXD1 | L19 |
+| TXD2 | F20 | RXD2 | H20 |
+| TXD3 | F19 | RXD3 | J20 |
+| TXCLK | H18 | RXCLK | J18 |
+| MDC | M20 | MDIO | M19 |
+
+### AD9226 ADC
+- Dual channel, 12-bit, 65 MSPS max, parallel output
+- FPGA provides 25 MHz sample clock to ADC
+- Connects via JP2 (BANK34, 40-pin)
+- 2 × (12 data + OTR + CLK) = 28 signal pins + power/ground
+
+### Vivado project
+- Script: `scripts/create_qmtech_project.tcl`
+- Project dir: `/home/sonnensn/qmtech_vivado/edm_qmtech/`
+- XSA output: `/home/sonnensn/qmtech_vivado/edm_qmtech.xsa`
+- PS7 config extracted from vendor's `design_1_bd.tcl` reference design
+
+### PetaLinux build
+- PetaLinux 2023.2 installed at `/tools/Xilinx/PetaLinux/2023.2`
+- **MUST build inside Docker container** (Ubuntu 22.04), NOT on host filesystem
+- Docker container: `petalinux_build` (Ubuntu 22.04 with build-essential, libtinfo5, lsb-release)
+- **CRITICAL: pseudo fails on Docker volume mounts** — project must be created inside the container filesystem (`/tmp/plbuild/`), not on a mounted host directory
+- Build user: `builder` (UID matches host user) — bitbake refuses to run as root
+- Built images at: `/home/sonnensn/qmtech_boot/` (BOOT.BIN, image.ub, rootfs.ext4)
+- Vendor factory image at: `/tmp/qmtech_factory/Factory_Binary_Image/`
+
+### Current status (2026-04-17)
+- PetaLinux image builds successfully (4154/4154 tasks)
+- Board boots with vendor image (Ethernet works, dropbear SSH)
+- Our PetaLinux image not yet booting — FSBL/U-Boot mismatch with board hardware suspected
+- Next: debug boot failure (serial console), then add Python to rootfs, then port EDM + AD9226
+
 ## Pending / Future Work
 
+- **Debug QMTech PetaLinux boot** — our BOOT.BIN doesn't boot; need to check FSBL/DDR config
+- **AD9226 capture RTL** — clock generation, parallel data capture, dual channel BRAM
+- **Port EDM design to QMTech** — new pin constraints for JP2/JP5 headers
 - **Hardware HV interlock**: DPDT switch or relay to physically disconnect PSU power
 - **LinuxCNC integration**: Configure mb2hal to read/write Modbus registers, wire AF1 to adaptive feed HAL pin
-- **AD9226 ADC upgrade**: External 12-bit 65MSPS ADC for higher sample rates (differential GPIO pairs needed)
-- **HelloFPGA Smart ZYNQ SL board** ($83, Zynq-7020): Alternative board under evaluation. Has PL Ethernet (not PS) — requires PetaLinux build. Files in `/home/sonnensn/Hellofpga/`
-- **Software watchdog in RTL**: Auto-disable pulses if PS doesn't heartbeat within 100ms (not yet implemented)
+- **Software watchdog in RTL**: Auto-disable pulses if PS doesn't heartbeat within 100ms
+
+## Lessons Learned
+
+### PetaLinux pseudo fails on Docker volume mounts
+When building PetaLinux inside Docker, the project directory MUST be on the container's own filesystem (e.g., `/tmp/plbuild/`), NOT on a volume-mounted host directory. Pseudo's file ownership tracking breaks across the Docker overlay filesystem boundary, causing random `do_install` task failures with "PermissionError" or "Broken pipe". The failure pattern is deceptive: the task log shows "Succeeded" but the task reports exit code 1.
+
+### Ubuntu 24.04 / kernel 6.17 blocks PetaLinux pseudo
+`kernel.apparmor_restrict_unprivileged_userns=1` (default on Ubuntu 24.04) blocks pseudo's user namespace operations. Fix: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. Even with this fix, pseudo still fails intermittently on the host — use Docker with Ubuntu 22.04 instead.
+
+### QMTech board uses PS GEM via EMIO (not PL Ethernet MAC)
+Despite Ethernet being on PL pins, the board uses the PS's built-in GEM controller routed through EMIO — same driver as MIO Ethernet, just different pin routing. No AXI Ethernet MAC IP needed. This is much simpler than a full PL Ethernet stack.
+
+### Docker setup for PetaLinux builds
+```bash
+# Start container (mount PetaLinux install read-only, XSA read-only)
+docker run --rm -d --name petalinux_build \
+  -v /tools/Xilinx/PetaLinux/2023.2:/tools/Xilinx/PetaLinux/2023.2:ro \
+  -v /home/sonnensn/qmtech_vivado:/home/sonnensn/qmtech_vivado:ro \
+  ubuntu:22.04 sleep infinity
+
+# Install deps
+docker exec petalinux_build bash -c 'apt-get update && apt-get install -y \
+  gawk xterm autoconf libtool texinfo gcc-multilib zlib1g-dev \
+  libncurses5-dev libssl-dev libglib2.0-dev net-tools python3 locales \
+  iproute2 diffstat xz-utils chrpath socat cpio file lz4 zstd wget \
+  git unzip rsync bc debianutils iputils-ping libegl1-mesa libsdl1.2-dev \
+  pylint python3-git python3-jinja2 python3-pexpect python3-subunit \
+  mesa-common-dev lsb-release build-essential libtinfo5 libncurses5 && \
+  locale-gen en_US.UTF-8 && ln -sf /bin/bash /bin/sh'
+
+# Create non-root build user
+docker exec petalinux_build useradd -m -s /bin/bash -u $(id -u) builder
+
+# Build (inside container filesystem, NOT a volume mount)
+docker exec petalinux_build su - builder -c '
+  export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 HOME=/home/builder
+  source /tools/Xilinx/PetaLinux/2023.2/settings.sh
+  cd /tmp && petalinux-create --type project --template zynq --name myproject
+  cd myproject && petalinux-config --get-hw-description /path/to/file.xsa --silentconfig
+  petalinux-build'
+
+# Copy images out
+docker cp petalinux_build:/tmp/myproject/images/linux/ ./output/
+```
