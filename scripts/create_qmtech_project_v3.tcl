@@ -1,7 +1,9 @@
 # create_qmtech_project_v3.tcl
-# Two-phase approach:
-# Phase 1: Create a block design with ONLY PS7 (no PL ports) → generates correct DDR/FIXED_IO
-# Phase 2: Add EDM logic as RTL top-level that wraps the PS7 BD + our modules
+# QMTech ZYJZGW Zynq-7010 EDM controller with AD9226 ADC
+#
+# Architecture: PS7 + AXI interconnect + EDM all inside one block design.
+# DDR/FIXED_IO handled by apply_bd_automation (PS-dedicated pins).
+# BD wrapper is the top module — no separate Verilog top needed.
 #
 # Usage: vivado -mode batch -source scripts/create_qmtech_project_v3.tcl
 
@@ -12,12 +14,21 @@ set rtl_dir /home/sonnensn/edm-fpga/rtl
 file delete -force $proj_dir/$proj_name
 create_project $proj_name $proj_dir/$proj_name -part xc7z010clg400-1
 
-# ── Phase 1: PS7-only block design ─────────────────────────
+# Add EDM RTL sources
+add_files -norecurse [list \
+    $rtl_dir/edm_top_qmtech.v \
+    $rtl_dir/ad9226_capture.v \
+    $rtl_dir/axi_edm_regs.v \
+    $rtl_dir/edm_pulse_ctrl.v \
+    $rtl_dir/waveform_capture.v \
+]
+update_compile_order -fileset sources_1
+
+# ── Block design ────────────────────────────────────────────
 create_bd_design "ps7_bd"
 
+# PS7 with DDR config set BEFORE apply_bd_automation
 set ps7 [create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 ps7]
-
-# Set DDR config BEFORE automation
 set_property -dict [list \
     CONFIG.PCW_CRYSTAL_PERIPHERAL_FREQMHZ {33.333333} \
     CONFIG.PCW_UIPARAM_DDR_MEMORY_TYPE {DDR 3} \
@@ -82,269 +93,108 @@ set_property -dict [list \
     CONFIG.PCW_EN_EMIO_ENET0 {1} \
 ] $ps7
 
+# DDR/FIXED_IO — handled as PS-dedicated pins
 apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \
     -config {make_external "FIXED_IO, DDR" Master "Disable" Slave "Disable"} $ps7
 
-# Make ALL PS7 ports external so our Verilog top can connect to them
-# FCLK and reset
-create_bd_port -dir O FCLK_CLK0
-connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_ports FCLK_CLK0]
-create_bd_port -dir O FCLK_RESET0_N
-connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_ports FCLK_RESET0_N]
-
-# GP0 AXI clock
+# GP0 clock
 connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins ps7/M_AXI_GP0_ACLK]
 
-# Ethernet EMIO — make external
+# ── Ethernet EMIO with MII 4↔8 bit adaptation ──────────────
+# External ports are 4-bit MII; internal PS7 is 8-bit GMII
 create_bd_port -dir I -type clk ENET0_GMII_RX_CLK
 create_bd_port -dir I -type clk ENET0_GMII_TX_CLK
 create_bd_port -dir I ENET0_GMII_RX_DV
 create_bd_port -dir O ENET0_GMII_TX_EN
-create_bd_port -dir I -from 7 -to 0 ENET0_GMII_RXD
-create_bd_port -dir O -from 7 -to 0 ENET0_GMII_TXD
+create_bd_port -dir I -from 3 -to 0 ENET0_RXD
+create_bd_port -dir O -from 3 -to 0 ENET0_TXD
+create_bd_intf_port -mode Master -vlnv xilinx.com:interface:mdio_rtl:1.0 MDIO_ETHERNET_0
+
+# TX: PS GMII TXD[7:0] → xlslice takes [3:0] → external 4-bit MII
+set txd_slice [create_bd_cell -type ip -vlnv xilinx.com:ip:xlslice:1.0 txd_slice]
+set_property -dict [list CONFIG.DIN_WIDTH {8} CONFIG.DIN_FROM {3} CONFIG.DIN_TO {0} CONFIG.DOUT_WIDTH {4}] $txd_slice
+connect_bd_net [get_bd_pins ps7/ENET0_GMII_TXD] [get_bd_pins txd_slice/Din]
+connect_bd_net [get_bd_pins txd_slice/Dout] [get_bd_ports ENET0_TXD]
+
+# RX: external 4-bit MII → xlconcat pads to 8-bit → PS GMII RXD[7:0]
+set rxd_concat [create_bd_cell -type ip -vlnv xilinx.com:ip:xlconcat:2.1 rxd_concat]
+set_property -dict [list CONFIG.IN0_WIDTH {4} CONFIG.IN1_WIDTH {4} CONFIG.NUM_PORTS {2}] $rxd_concat
+set const_zero_4 [create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 const_zero_4]
+set_property -dict [list CONFIG.CONST_WIDTH {4} CONFIG.CONST_VAL {0}] $const_zero_4
+connect_bd_net [get_bd_ports ENET0_RXD] [get_bd_pins rxd_concat/In0]
+connect_bd_net [get_bd_pins const_zero_4/dout] [get_bd_pins rxd_concat/In1]
+connect_bd_net [get_bd_pins rxd_concat/dout] [get_bd_pins ps7/ENET0_GMII_RXD]
+
+# Other Ethernet signals
 connect_bd_net [get_bd_ports ENET0_GMII_RX_CLK] [get_bd_pins ps7/ENET0_GMII_RX_CLK]
 connect_bd_net [get_bd_ports ENET0_GMII_TX_CLK] [get_bd_pins ps7/ENET0_GMII_TX_CLK]
 connect_bd_net [get_bd_ports ENET0_GMII_RX_DV] [get_bd_pins ps7/ENET0_GMII_RX_DV]
 connect_bd_net [get_bd_pins ps7/ENET0_GMII_TX_EN] [get_bd_ports ENET0_GMII_TX_EN]
-connect_bd_net [get_bd_ports ENET0_GMII_RXD] [get_bd_pins ps7/ENET0_GMII_RXD]
-connect_bd_net [get_bd_pins ps7/ENET0_GMII_TXD] [get_bd_ports ENET0_GMII_TXD]
-
-# MDIO
-create_bd_intf_port -mode Master -vlnv xilinx.com:interface:mdio_rtl:1.0 MDIO_ETHERNET_0
 connect_bd_intf_net [get_bd_intf_ports MDIO_ETHERNET_0] [get_bd_intf_pins ps7/MDIO_ETHERNET_0]
 
-# AXI GP0 — make external as interface
-create_bd_intf_port -mode Master -vlnv xilinx.com:interface:aximm_rtl:1.0 M_AXI_GP0
-set_property CONFIG.PROTOCOL AXI3 [get_bd_intf_ports M_AXI_GP0]
-connect_bd_intf_net [get_bd_intf_pins ps7/M_AXI_GP0] [get_bd_intf_ports M_AXI_GP0]
+# ── AXI interconnect + EDM IP ───────────────────────────────
+create_bd_cell -type module -reference edm_top_qmtech edm_0
+
+set axi_ic [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_ic]
+set_property CONFIG.NUM_MI {1} $axi_ic
+
+# AXI path: PS GP0 → interconnect → EDM (protocol conversion handled)
+connect_bd_intf_net [get_bd_intf_pins ps7/M_AXI_GP0] [get_bd_intf_pins axi_ic/S00_AXI]
+connect_bd_intf_net [get_bd_intf_pins axi_ic/M00_AXI] [get_bd_intf_pins edm_0/S_AXI]
+
+# Clocks for interconnect + EDM
+connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_ic/ACLK]
+connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_ic/S00_ACLK]
+connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_ic/M00_ACLK]
+connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins edm_0/S_AXI_ACLK]
+
+# Resets
+connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_ic/ARESETN]
+connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_ic/S00_ARESETN]
+connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_ic/M00_ARESETN]
+connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins edm_0/S_AXI_ARESETN]
+
+# ── EDM external ports ──────────────────────────────────────
+create_bd_port -dir I -from 11 -to 0 adc_a_data
+create_bd_port -dir I adc_a_otr
+create_bd_port -dir I -from 11 -to 0 adc_b_data
+create_bd_port -dir I adc_b_otr
+create_bd_port -dir O adc_clk
+create_bd_port -dir I hv_enable
+create_bd_port -dir O pulse_out
+create_bd_port -dir O lamp_green
+create_bd_port -dir O lamp_orange
+create_bd_port -dir O lamp_red
+
+connect_bd_net [get_bd_ports adc_a_data] [get_bd_pins edm_0/adc_a_data]
+connect_bd_net [get_bd_ports adc_a_otr] [get_bd_pins edm_0/adc_a_otr]
+connect_bd_net [get_bd_ports adc_b_data] [get_bd_pins edm_0/adc_b_data]
+connect_bd_net [get_bd_ports adc_b_otr] [get_bd_pins edm_0/adc_b_otr]
+connect_bd_net [get_bd_pins edm_0/adc_clk] [get_bd_ports adc_clk]
+connect_bd_net [get_bd_ports hv_enable] [get_bd_pins edm_0/hv_enable]
+connect_bd_net [get_bd_pins edm_0/pulse_out] [get_bd_ports pulse_out]
+connect_bd_net [get_bd_pins edm_0/lamp_green] [get_bd_ports lamp_green]
+connect_bd_net [get_bd_pins edm_0/lamp_orange] [get_bd_ports lamp_orange]
+connect_bd_net [get_bd_pins edm_0/lamp_red] [get_bd_ports lamp_red]
+
+# Tie off AXI-Stream
+set tready_c [create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 tready_c]
+set_property -dict [list CONFIG.CONST_WIDTH {1} CONFIG.CONST_VAL {0}] $tready_c
+connect_bd_net [get_bd_pins tready_c/dout] [get_bd_pins edm_0/m_axis_tready]
+
+# Address map
+assign_bd_address -target_address_space /ps7/Data [get_bd_addr_segs edm_0/S_AXI/reg0]
+set_property offset 0x43C00000 [get_bd_addr_segs ps7/Data/SEG_edm_0_reg0]
+set_property range 4K [get_bd_addr_segs ps7/Data/SEG_edm_0_reg0]
 
 validate_bd_design
 save_bd_design
 
-# Generate output products and wrapper
+# ── Generate wrapper (BD wrapper is the top module) ─────────
 generate_target all [get_files ps7_bd.bd]
 make_wrapper -files [get_files ps7_bd.bd] -top
 add_files -norecurse $proj_dir/$proj_name/$proj_name.gen/sources_1/bd/ps7_bd/hdl/ps7_bd_wrapper.v
-
-# ── Phase 2: Create Verilog top level ──────────────────────
-# The PS7 BD wrapper handles DDR/FIXED_IO internally.
-# Our top level instantiates it + EDM + Ethernet glue.
-
-# Add RTL sources
-add_files -norecurse [list \
-    $rtl_dir/edm_top_qmtech.v \
-    $rtl_dir/ad9226_capture.v \
-    $rtl_dir/axi_edm_regs.v \
-    $rtl_dir/edm_pulse_ctrl.v \
-    $rtl_dir/waveform_capture.v \
-]
-
-# Create the top-level wrapper in TCL (writes Verilog file)
-set top_file $proj_dir/$proj_name/top.v
-set fp [open $top_file w]
-puts $fp {`timescale 1ns/1ps
-module top (
-    inout  wire [14:0] DDR_addr,
-    inout  wire [2:0]  DDR_ba,
-    inout  wire        DDR_cas_n,
-    inout  wire        DDR_ck_n,
-    inout  wire        DDR_ck_p,
-    inout  wire        DDR_cke,
-    inout  wire        DDR_cs_n,
-    inout  wire [1:0]  DDR_dm,
-    inout  wire [15:0] DDR_dq,
-    inout  wire [1:0]  DDR_dqs_n,
-    inout  wire [1:0]  DDR_dqs_p,
-    inout  wire        DDR_odt,
-    inout  wire        DDR_ras_n,
-    inout  wire        DDR_reset_n,
-    inout  wire        DDR_we_n,
-    inout  wire        FIXED_IO_ddr_vrn,
-    inout  wire        FIXED_IO_ddr_vrp,
-    inout  wire [53:0] FIXED_IO_mio,
-    inout  wire        FIXED_IO_ps_clk,
-    inout  wire        FIXED_IO_ps_porb,
-    inout  wire        FIXED_IO_ps_srstb,
-    // MII Ethernet
-    input  wire        eth_rx_clk,
-    input  wire        eth_tx_clk,
-    input  wire        eth_rx_dv,
-    input  wire [3:0]  eth_rxd,
-    output wire        eth_tx_en,
-    output wire [3:0]  eth_txd,
-    inout  wire        eth_mdio,
-    output wire        eth_mdc,
-    // AD9226 ADC
-    input  wire [11:0] adc_a_data,
-    input  wire        adc_a_otr,
-    input  wire [11:0] adc_b_data,
-    input  wire        adc_b_otr,
-    output wire        adc_clk,
-    // EDM I/O
-    input  wire        hv_enable,
-    output wire        pulse_out,
-    output wire        lamp_green,
-    output wire        lamp_orange,
-    output wire        lamp_red
-);
-
-wire        fclk_clk0;
-wire        fclk_reset0_n;
-wire [7:0]  gmii_txd;
-wire [7:0]  gmii_rxd;
-
-// MII 4↔8 adaptation
-assign eth_txd = gmii_txd[3:0];
-assign eth_tx_en = gmii_tx_en_int;
-assign gmii_rxd = {4'b0000, eth_rxd};
-wire gmii_tx_en_int;
-
-// AXI GP0 wires
-wire [31:0] gp0_araddr, gp0_awaddr, gp0_rdata, gp0_wdata;
-wire [2:0]  gp0_arprot, gp0_awprot;
-wire        gp0_arvalid, gp0_arready, gp0_rvalid, gp0_rready;
-wire [1:0]  gp0_rresp, gp0_bresp;
-wire        gp0_awvalid, gp0_awready;
-wire        gp0_wvalid, gp0_wready;
-wire [3:0]  gp0_wstrb;
-wire        gp0_bvalid, gp0_bready;
-// Full AXI4 signals (unused by our AXI-Lite slave)
-wire [11:0] gp0_arid, gp0_awid, gp0_bid, gp0_rid;
-wire [3:0]  gp0_arlen, gp0_awlen;
-wire [2:0]  gp0_arsize, gp0_awsize;
-wire [1:0]  gp0_arburst, gp0_awburst, gp0_arlock, gp0_awlock;
-wire [3:0]  gp0_arcache, gp0_awcache, gp0_arqos, gp0_awqos;
-wire        gp0_rlast, gp0_wlast;
-wire [11:0] gp0_wid;
-
-// PS7 block design instance
-ps7_bd_wrapper u_ps7 (
-    .DDR_addr          (DDR_addr),
-    .DDR_ba            (DDR_ba),
-    .DDR_cas_n         (DDR_cas_n),
-    .DDR_ck_n          (DDR_ck_n),
-    .DDR_ck_p          (DDR_ck_p),
-    .DDR_cke           (DDR_cke),
-    .DDR_cs_n          (DDR_cs_n),
-    .DDR_dm            (DDR_dm),
-    .DDR_dq            (DDR_dq),
-    .DDR_dqs_n         (DDR_dqs_n),
-    .DDR_dqs_p         (DDR_dqs_p),
-    .DDR_odt           (DDR_odt),
-    .DDR_ras_n         (DDR_ras_n),
-    .DDR_reset_n       (DDR_reset_n),
-    .DDR_we_n          (DDR_we_n),
-    .FIXED_IO_ddr_vrn  (FIXED_IO_ddr_vrn),
-    .FIXED_IO_ddr_vrp  (FIXED_IO_ddr_vrp),
-    .FIXED_IO_mio      (FIXED_IO_mio),
-    .FIXED_IO_ps_clk   (FIXED_IO_ps_clk),
-    .FIXED_IO_ps_porb  (FIXED_IO_ps_porb),
-    .FIXED_IO_ps_srstb (FIXED_IO_ps_srstb),
-    .FCLK_CLK0         (fclk_clk0),
-    .FCLK_RESET0_N     (fclk_reset0_n),
-    // Ethernet EMIO
-    .ENET0_GMII_RX_CLK (eth_rx_clk),
-    .ENET0_GMII_TX_CLK (eth_tx_clk),
-    .ENET0_GMII_RX_DV  (eth_rx_dv),
-    .ENET0_GMII_TX_EN  (gmii_tx_en_int),
-    .ENET0_GMII_RXD    (gmii_rxd),
-    .ENET0_GMII_TXD    (gmii_txd),
-    .MDIO_ETHERNET_0_mdc    (eth_mdc),
-    .MDIO_ETHERNET_0_mdio_io(eth_mdio),
-    // AXI GP0
-    .M_AXI_GP0_araddr  (gp0_araddr),
-    .M_AXI_GP0_arburst (gp0_arburst),
-    .M_AXI_GP0_arcache (gp0_arcache),
-    .M_AXI_GP0_arid    (gp0_arid),
-    .M_AXI_GP0_arlen   (gp0_arlen),
-    .M_AXI_GP0_arlock  (gp0_arlock),
-    .M_AXI_GP0_arprot  (gp0_arprot),
-    .M_AXI_GP0_arqos   (gp0_arqos),
-    .M_AXI_GP0_arready (gp0_arready),
-    .M_AXI_GP0_arsize  (gp0_arsize),
-    .M_AXI_GP0_arvalid (gp0_arvalid),
-    .M_AXI_GP0_awaddr  (gp0_awaddr),
-    .M_AXI_GP0_awburst (gp0_awburst),
-    .M_AXI_GP0_awcache (gp0_awcache),
-    .M_AXI_GP0_awid    (gp0_awid),
-    .M_AXI_GP0_awlen   (gp0_awlen),
-    .M_AXI_GP0_awlock  (gp0_awlock),
-    .M_AXI_GP0_awprot  (gp0_awprot),
-    .M_AXI_GP0_awqos   (gp0_awqos),
-    .M_AXI_GP0_awready (gp0_awready),
-    .M_AXI_GP0_awsize  (gp0_awsize),
-    .M_AXI_GP0_awvalid (gp0_awvalid),
-    .M_AXI_GP0_bid     (gp0_bid),
-    .M_AXI_GP0_bready  (gp0_bready),
-    .M_AXI_GP0_bresp   (gp0_bresp),
-    .M_AXI_GP0_bvalid  (gp0_bvalid),
-    .M_AXI_GP0_rdata   (gp0_rdata),
-    .M_AXI_GP0_rid     (gp0_rid),
-    .M_AXI_GP0_rlast   (gp0_rlast),
-    .M_AXI_GP0_rready  (gp0_rready),
-    .M_AXI_GP0_rresp   (gp0_rresp),
-    .M_AXI_GP0_rvalid  (gp0_rvalid),
-    .M_AXI_GP0_wdata   (gp0_wdata),
-    .M_AXI_GP0_wid     (gp0_wid),
-    .M_AXI_GP0_wlast   (gp0_wlast),
-    .M_AXI_GP0_wready  (gp0_wready),
-    .M_AXI_GP0_wstrb   (gp0_wstrb),
-    .M_AXI_GP0_wvalid  (gp0_wvalid)
-);
-
-// EDM controller (AXI4-Lite slave)
-edm_top_qmtech #(
-    .C_S_AXI_DATA_WIDTH(32),
-    .C_S_AXI_ADDR_WIDTH(12)
-) u_edm (
-    .S_AXI_ACLK    (fclk_clk0),
-    .S_AXI_ARESETN (fclk_reset0_n),
-    .S_AXI_AWADDR  (gp0_awaddr[11:0]),
-    .S_AXI_AWPROT  (gp0_awprot),
-    .S_AXI_AWVALID (gp0_awvalid),
-    .S_AXI_AWREADY (gp0_awready),
-    .S_AXI_WDATA   (gp0_wdata),
-    .S_AXI_WSTRB   (gp0_wstrb),
-    .S_AXI_WVALID  (gp0_wvalid),
-    .S_AXI_WREADY  (gp0_wready),
-    .S_AXI_BRESP   (gp0_bresp),
-    .S_AXI_BVALID  (gp0_bvalid),
-    .S_AXI_BREADY  (gp0_bready),
-    .S_AXI_ARADDR  (gp0_araddr[11:0]),
-    .S_AXI_ARPROT  (gp0_arprot),
-    .S_AXI_ARVALID (gp0_arvalid),
-    .S_AXI_ARREADY (gp0_arready),
-    .S_AXI_RDATA   (gp0_rdata),
-    .S_AXI_RRESP   (gp0_rresp),
-    .S_AXI_RVALID  (gp0_rvalid),
-    .S_AXI_RREADY  (gp0_rready),
-    .hv_enable     (hv_enable),
-    .pulse_out     (pulse_out),
-    .lamp_green    (lamp_green),
-    .lamp_orange   (lamp_orange),
-    .lamp_red      (lamp_red),
-    .adc_a_data    (adc_a_data),
-    .adc_a_otr     (adc_a_otr),
-    .adc_b_data    (adc_b_data),
-    .adc_b_otr     (adc_b_otr),
-    .adc_clk       (adc_clk),
-    .m_axis_tdata  (),
-    .m_axis_tvalid (),
-    .m_axis_tlast  (),
-    .m_axis_tready (1'b0)
-);
-
-// AXI4 response signals for unused burst features
-assign gp0_rlast = 1'b1;
-assign gp0_bid   = gp0_awid;
-assign gp0_rid   = gp0_arid;
-
-endmodule}
-close $fp
-
-add_files -norecurse $top_file
-set_property top top [current_fileset]
-update_compile_order -fileset sources_1
+set_property top ps7_bd_wrapper [current_fileset]
 
 # ── Constraints ─────────────────────────────────────────────
 set xdc_file $proj_dir/$proj_name/$proj_name.srcs/constrs_1/new/qmtech.xdc
@@ -353,20 +203,20 @@ set fp [open $xdc_file w]
 puts $fp "# QMTech ZYJZGW Zynq-7010 — Pin Constraints"
 puts $fp ""
 puts $fp "# MII Ethernet (IP101GA, BANK35)"
-puts $fp "set_property -dict {PACKAGE_PIN D20 IOSTANDARD LVCMOS33} \[get_ports eth_tx_en\]"
-puts $fp "set_property -dict {PACKAGE_PIN G20 IOSTANDARD LVCMOS33} \[get_ports {eth_txd\[0\]}\]"
-puts $fp "set_property -dict {PACKAGE_PIN G19 IOSTANDARD LVCMOS33} \[get_ports {eth_txd\[1\]}\]"
-puts $fp "set_property -dict {PACKAGE_PIN F20 IOSTANDARD LVCMOS33} \[get_ports {eth_txd\[2\]}\]"
-puts $fp "set_property -dict {PACKAGE_PIN F19 IOSTANDARD LVCMOS33} \[get_ports {eth_txd\[3\]}\]"
-puts $fp "set_property -dict {PACKAGE_PIN M18 IOSTANDARD LVCMOS33} \[get_ports eth_rx_dv\]"
-puts $fp "set_property -dict {PACKAGE_PIN L20 IOSTANDARD LVCMOS33} \[get_ports {eth_rxd\[0\]}\]"
-puts $fp "set_property -dict {PACKAGE_PIN L19 IOSTANDARD LVCMOS33} \[get_ports {eth_rxd\[1\]}\]"
-puts $fp "set_property -dict {PACKAGE_PIN H20 IOSTANDARD LVCMOS33} \[get_ports {eth_rxd\[2\]}\]"
-puts $fp "set_property -dict {PACKAGE_PIN J20 IOSTANDARD LVCMOS33} \[get_ports {eth_rxd\[3\]}\]"
-puts $fp "set_property -dict {PACKAGE_PIN J18 IOSTANDARD LVCMOS33} \[get_ports eth_rx_clk\]"
-puts $fp "set_property -dict {PACKAGE_PIN H18 IOSTANDARD LVCMOS33} \[get_ports eth_tx_clk\]"
-puts $fp "set_property -dict {PACKAGE_PIN M19 IOSTANDARD LVCMOS33} \[get_ports eth_mdio\]"
-puts $fp "set_property -dict {PACKAGE_PIN M20 IOSTANDARD LVCMOS33} \[get_ports eth_mdc\]"
+puts $fp "set_property -dict {PACKAGE_PIN D20 IOSTANDARD LVCMOS33} \[get_ports ENET0_GMII_TX_EN\]"
+puts $fp "set_property -dict {PACKAGE_PIN G20 IOSTANDARD LVCMOS33} \[get_ports {ENET0_TXD\[0\]}\]"
+puts $fp "set_property -dict {PACKAGE_PIN G19 IOSTANDARD LVCMOS33} \[get_ports {ENET0_TXD\[1\]}\]"
+puts $fp "set_property -dict {PACKAGE_PIN F20 IOSTANDARD LVCMOS33} \[get_ports {ENET0_TXD\[2\]}\]"
+puts $fp "set_property -dict {PACKAGE_PIN F19 IOSTANDARD LVCMOS33} \[get_ports {ENET0_TXD\[3\]}\]"
+puts $fp "set_property -dict {PACKAGE_PIN M18 IOSTANDARD LVCMOS33} \[get_ports ENET0_GMII_RX_DV\]"
+puts $fp "set_property -dict {PACKAGE_PIN L20 IOSTANDARD LVCMOS33} \[get_ports {ENET0_RXD\[0\]}\]"
+puts $fp "set_property -dict {PACKAGE_PIN L19 IOSTANDARD LVCMOS33} \[get_ports {ENET0_RXD\[1\]}\]"
+puts $fp "set_property -dict {PACKAGE_PIN H20 IOSTANDARD LVCMOS33} \[get_ports {ENET0_RXD\[2\]}\]"
+puts $fp "set_property -dict {PACKAGE_PIN J20 IOSTANDARD LVCMOS33} \[get_ports {ENET0_RXD\[3\]}\]"
+puts $fp "set_property -dict {PACKAGE_PIN J18 IOSTANDARD LVCMOS33} \[get_ports ENET0_GMII_RX_CLK\]"
+puts $fp "set_property -dict {PACKAGE_PIN H18 IOSTANDARD LVCMOS33} \[get_ports ENET0_GMII_TX_CLK\]"
+puts $fp "set_property -dict {PACKAGE_PIN M19 IOSTANDARD LVCMOS33} \[get_ports MDIO_ETHERNET_0_mdio_io\]"
+puts $fp "set_property -dict {PACKAGE_PIN M20 IOSTANDARD LVCMOS33} \[get_ports MDIO_ETHERNET_0_mdc\]"
 puts $fp ""
 puts $fp "# AD9226 ADC (BANK34, JP2)"
 puts $fp "set_property -dict {PACKAGE_PIN P20 IOSTANDARD LVCMOS33} \[get_ports {adc_a_data\[0\]}\]"
