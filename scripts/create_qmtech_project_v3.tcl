@@ -55,7 +55,11 @@ set_property -dict [list \
     CONFIG.PCW_DQ_WIDTH {16} \
     CONFIG.PCW_EN_DDR {1} \
     CONFIG.PCW_APU_PERIPHERAL_FREQMHZ {666.666666} \
-    CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {100} \
+    CONFIG.PCW_IOPLL_CTRL_FBDIV {36} \
+    CONFIG.PCW_IO_IO_PLL_FREQMHZ {1200.000} \
+    CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {50} \
+    CONFIG.PCW_FCLK0_PERIPHERAL_DIVISOR0 {6} \
+    CONFIG.PCW_FCLK0_PERIPHERAL_DIVISOR1 {4} \
     CONFIG.PCW_FPGA_FCLK0_ENABLE {1} \
     CONFIG.PCW_EN_CLK0_PORT {1} \
     CONFIG.PCW_EN_RST0_PORT {0} \
@@ -97,7 +101,7 @@ set_property -dict [list \
 apply_bd_automation -rule xilinx.com:bd_rule:processing_system7 \
     -config {make_external "FIXED_IO, DDR" Master "Disable" Slave "Disable"} $ps7
 
-# GP0 clock
+# GP0 clock — FCLK0 is 50 MHz, everything runs at 50 MHz
 connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins ps7/M_AXI_GP0_ACLK]
 
 # ── Ethernet EMIO with MII 4↔8 bit adaptation ──────────────
