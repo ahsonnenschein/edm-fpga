@@ -58,7 +58,7 @@ set_property -dict [list \
     CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ {100} \
     CONFIG.PCW_FPGA_FCLK0_ENABLE {1} \
     CONFIG.PCW_EN_CLK0_PORT {1} \
-    CONFIG.PCW_EN_RST0_PORT {1} \
+    CONFIG.PCW_EN_RST0_PORT {0} \
     CONFIG.PCW_USE_M_AXI_GP0 {1} \
     CONFIG.PCW_UART0_PERIPHERAL_ENABLE {1} \
     CONFIG.PCW_UART0_UART0_IO {MIO 14 .. 15} \
@@ -148,11 +148,18 @@ connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_ic/S00_ACLK]
 connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins axi_ic/M00_ACLK]
 connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins edm_0/S_AXI_ACLK]
 
-# Resets
-connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_ic/ARESETN]
-connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_ic/S00_ARESETN]
-connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins axi_ic/M00_ARESETN]
-connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins edm_0/S_AXI_ARESETN]
+# Resets — use proc_sys_reset to generate clean reset from FCLK
+# This works even if FCLK_RESET0_N isn't enabled in PS7 config
+set rst [create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 rst_0]
+connect_bd_net [get_bd_pins ps7/FCLK_CLK0] [get_bd_pins rst_0/slowest_sync_clk]
+# Tie ext_reset_in high (always run) — proc_sys_reset generates its own power-on reset
+set const_1 [create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant:1.1 const_rst]
+set_property -dict [list CONFIG.CONST_WIDTH {1} CONFIG.CONST_VAL {1}] $const_1
+connect_bd_net [get_bd_pins const_rst/dout] [get_bd_pins rst_0/ext_reset_in]
+connect_bd_net [get_bd_pins rst_0/interconnect_aresetn] [get_bd_pins axi_ic/ARESETN]
+connect_bd_net [get_bd_pins rst_0/peripheral_aresetn] [get_bd_pins axi_ic/S00_ARESETN]
+connect_bd_net [get_bd_pins rst_0/peripheral_aresetn] [get_bd_pins axi_ic/M00_ARESETN]
+connect_bd_net [get_bd_pins rst_0/peripheral_aresetn] [get_bd_pins edm_0/S_AXI_ARESETN]
 
 # ── EDM external ports ──────────────────────────────────────
 create_bd_port -dir I -from 11 -to 0 adc_a_data
