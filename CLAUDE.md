@@ -283,17 +283,30 @@ A $45 QMTech ZYJZGW Zynq-7010 Starter Kit is being brought up as the next-gen ED
 - Built images at: `/home/sonnensn/qmtech_boot/` (BOOT.BIN, image.ub, rootfs.ext4)
 - Vendor factory image at: `/tmp/qmtech_factory/Factory_Binary_Image/`
 
-### Current status (2026-04-17)
-- PetaLinux image builds successfully (4154/4154 tasks)
-- Board boots with vendor image (Ethernet works, dropbear SSH)
-- Our PetaLinux image not yet booting — FSBL/U-Boot mismatch with board hardware suspected
-- Next: debug boot failure (serial console), then add Python to rootfs, then port EDM + AD9226
+### Current status (2026-04-19)
+- **Vivado build SUCCEEDS** — bitstream generated for XC7Z010 with EDM + AD9226 + Ethernet
+- Resource usage: 23% LUTs, 38% registers, 44% I/O — plenty of headroom
+- PetaLinux image with Python 3.10 boots (vendor BOOT.BIN + our image.ub)
+- Runtime bitstream loading via `/dev/xdevcfg` confirmed working
+- Python 3.10 with json/socket/mmap/threading verified on board
+- `/dev/mem` mmap at 0x43C00000 works as root
+- Our FSBL doesn't boot (Vivado 2023.2 FSBL incompatible with this board) — use vendor's BOOT.BIN
+- SSH/sshd setup doesn't persist across reboots (ramdisk image)
+
+### Boot procedure
+1. SD card: vendor `BOOT.BIN` + our PetaLinux `image.ub` (with Python)
+2. Board boots with vendor FSBL+U-Boot, loads our kernel+rootfs from image.ub
+3. At U-Boot prompt, type `boot` if auto-boot doesn't start
+4. Login: `petalinux` / `Pastina`, then `sudo su` for root
+5. Fix SSH each boot: `sudo ssh-keygen -A && sudo sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && sudo /usr/sbin/sshd`
+6. Load EDM bitstream: `cat /path/to/edm_qmtech.bin > /dev/xdevcfg`
 
 ## Pending / Future Work
 
-- **Debug QMTech PetaLinux boot** — our BOOT.BIN doesn't boot; need to check FSBL/DDR config
-- **AD9226 capture RTL** — clock generation, parallel data capture, dual channel BRAM
-- **Port EDM design to QMTech** — new pin constraints for JP2/JP5 headers
+- **Test EDM bitstream on QMTech board** — load via xdevcfg, verify AXI register access
+- **Connect AD9226 board** — solder JP2 header, plug in ADC board, test data capture
+- **Adapt xadc_server.py** for AD9226 (same register map, different scaling)
+- **Persistent boot** — either fix our FSBL or create startup script for SSH + bitstream loading
 - **Hardware HV interlock**: DPDT switch or relay to physically disconnect PSU power
 - **LinuxCNC integration**: Configure mb2hal to read/write Modbus registers, wire AF1 to adaptive feed HAL pin
 - **Software watchdog in RTL**: Auto-disable pulses if PS doesn't heartbeat within 100ms
@@ -305,6 +318,9 @@ When building PetaLinux inside Docker, the project directory MUST be on the cont
 
 ### Ubuntu 24.04 / kernel 6.17 blocks PetaLinux pseudo
 `kernel.apparmor_restrict_unprivileged_userns=1` (default on Ubuntu 24.04) blocks pseudo's user namespace operations. Fix: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. Even with this fix, pseudo still fails intermittently on the host — use Docker with Ubuntu 22.04 instead.
+
+### Zynq-7010 DDR/FIXED_IO placement requires PS7-only block design
+On the XC7Z010 (100 PL I/O pins), Vivado 2023.2 incorrectly counts PS DDR/FIXED_IO ports as PL I/O when they're in a block design with PL logic. The XC7Z020 (200 PL I/O) masks this by having enough pins. **Fix:** Create a block design containing ONLY the PS7 (with DDR/FIXED_IO via `apply_bd_automation`), then wrap it from a Verilog top-level alongside the PL logic. The PS7 BD wrapper's DDR/FIXED_IO connect internally to PS-dedicated pins, while only the actual PL ports appear as top-level I/O. See `scripts/create_qmtech_project_v3.tcl`.
 
 ### QMTech board uses PS GEM via EMIO (not PL Ethernet MAC)
 Despite Ethernet being on PL pins, the board uses the PS's built-in GEM controller routed through EMIO — same driver as MIO Ethernet, just different pin routing. No AXI Ethernet MAC IP needed. This is much simpler than a full PL Ethernet stack.
